@@ -691,7 +691,7 @@ GPU inference нельзя балансировать как обычные HTTP
                          └──────────┬──────────┘
                                     │
                          ┌──────────▼──────────┐
-                         │      GeoDNS         │
+                         │      GeoDNS         │ // TODO: GeoDNS может быть перед AnyCast
                          │   (Route53/CF)      │
                          └──────────┬──────────┘
                                     │
@@ -711,7 +711,7 @@ GPU inference нельзя балансировать как обычные HTTP
                                    │
                          ┌─────────▼─────────┐
                          │  Global Message   │
-                         │  Queue (Kafka)    │
+                         │  Queue (Kafka)    │  // TODO: Здесь можно убрать
                          └─────────┬─────────┘
                                    │
                     ┌──────────────┼──────────────┐
@@ -726,6 +726,710 @@ GPU inference нельзя балансировать как обычные HTTP
 
 ---
 
+# 4. Локальная балансировка нагрузки
+
+## 4.1 Схема балансировки внутри региона
+
+```mermaid
+graph TD
+    Internet["Internet / CDN"]
+
+    Internet --> L4_1["L3/L4 IPVS<br/>(Active)"]
+    Internet --> L4_2["L3/L4 IPVS<br/>(Standby)"]
+    L4_1 <-->|"VRRP"| L4_2
+
+    L4_1 --> Nginx1["Nginx #1<br/>SSL Term"]
+    L4_1 --> Nginx2["Nginx #2<br/>SSL Term"]
+    L4_1 --> NginxN["Nginx #N<br/>SSL Term"]
+
+    Nginx1 & Nginx2 & NginxN --> GW["API Gateway Pods<br/>(K8s Service)"]
+
+    GW --> Chat["Chat Service"]
+    GW --> Auth["Auth Service"]
+
+    Chat --> Kafka["Kafka"]
+    Kafka --> Sched["Inference Scheduler"]
+    Sched --> GPU["GPU Workers"]
+    GPU --> Redis["Redis Streams"]
+    Redis --> SSE["SSE Gateway"]
+    SSE -->|"SSE через Nginx"| Internet
+```
+
+---
+
+## 4.2 Уровни балансировки и резервирование
+
+| Уровень | Компонент | Алгоритм | Резервирование | Обоснование |
+| --- | --- | --- | --- | --- |
+| L3/L4 | IPVS | Least Connections | **N+1** | Лёгкий, в ядре Linux, VRRP failover < 3 сек |
+| L7 | Nginx (SSL termination) | Least Conn + Weight | **N×2** | CPU-intensive TLS + SSE. При потере 50% — остальные держат peak |
+| Application | API Gateway (K8s) | Round Robin | **N+1** | K8s auto-reschedule ~30 сек |
+| Backend | Chat/Auth Service | Round Robin | **N+1** | K8s auto-reschedule |
+| Queue | Kafka | Partitioning | **RF=3** | ISR replication |
+| Inference | GPU Workers | Queue-based | **N+1** | При падении GPU — запрос возвращается в очередь |
+| Streaming | Redis + SSE Gateway | Hash / Least Conn | Redis **N×2**, SSE **N+1** | Горячие данные + K8s reschedule |
+
+---
+
+## 4.3 Расчёт количества L7 балансировщиков (Nginx)
+
+Исходные данные из раздела 3:
+
+| Регион | API RPS (peak) | Inference RPS (peak) |
+| --- | --- | --- |
+| US East | 20 400 | 46 400 |
+| US West | 20 400 | 46 400 |
+| EU Central | 40 600 | 17 400 |
+| APAC | 34 800 | 5 800 |
+
+*Inference peak = avg × 4 (burst-коэффициент из раздела 2)*
+
+По данным бенчмарков Nginx [^6][^7]:
+- Concurrent connections: **~300 000** на сервер
+- Пропускная способность: **10 Gbit/s NIC × 70% ≈ 7 Gbit/s**
+
+### Ограничитель 1: SSL Termination (CPS)
+
+~30% запросов создают новые TLS-соединения (остальные — keep-alive):
+
+| Регион | Peak API RPS | Peak CPS (×0.3) | Nginx нод |
+| --- | --- | --- | --- |
+| US East | 20 400 | 6 120 | 1 |
+| US West | 20 400 | 6 120 | 1 |
+| EU Central | 40 600 | 12 180 | 1 |
+| APAC | 34 800 | 10 440 | 1 |
+
+### Ограничитель 2: Пропускная способность сети
+
+Peak throughput = 5.4 Gbit/s (из раздела 2), распределение пропорционально API RPS:
+
+| Регион | Доля API | Peak Gbit/s | Nginx нод |
+| --- | --- | --- | --- |
+| US East | 17.6% | 0.95 | 1 |
+| US West | 17.6% | 0.95 | 1 |
+| EU Central | 35% | 1.89 | 1 |
+| APAC | 30% | 1.62 | 1 |
+
+### Ограничитель 3: SSE concurrent connections (определяющий)
+
+Каждый inference-запрос удерживает SSE-соединение ~15 сек:
+
+| Регион | Peak Inference RPS | Concurrent SSE (×15s) | Nginx нод |
+| --- | --- | --- | --- |
+| US East | 46 400 | 696 000 | 3 |
+| US West | 46 400 | 696 000 | 3 |
+| EU Central | 17 400 | 261 000 | 1 |
+| APAC | 5 800 | 87 000 | 1 |
+
+### Итог по Nginx
+
+| Регион | По CPS | По сети | По SSE | **Max** | **С N×2** |
+| --- | --- | --- | --- | --- | --- |
+| US East | 1 | 1 | **3** | 3 | **6** |
+| US West | 1 | 1 | **3** | 3 | **6** |
+| EU Central | 1 | 1 | **1** | 1 | **2** |
+| APAC | 1 | 1 | **1** | 1 | **2** |
+
+---
+
+## 4.4 Расчёт количества L3/L4 балансировщиков
+
+L4 (IPVS) пропускная способность: ~40 Gbit/s на ноду
+
+| Регион | Peak Gbit/s | L4 нод | С N+1 |
+| --- | --- | --- | --- |
+| US East | 0.95 | 1 | **2** |
+| US West | 0.95 | 1 | **2** |
+| EU Central | 1.89 | 1 | **2** |
+| APAC | 1.62 | 1 | **2** |
+
+---
+
+## 4.5 Сводная таблица
+
+| Компонент | US East | US West | EU | APAC | **Всего** |
+| --- | --- | --- | --- | --- | --- |
+| L3/L4 (N+1) | 2 | 2 | 2 | 2 | **8** |
+| L7 Nginx (N×2) | 6 | 6 | 2 | 2 | **16** |
+
+# 5. Логическая схема БД
+
+## 5.1 ER-диаграмма
+
+```mermaid
+erDiagram
+    users ||--o{ conversations : "создаёт"
+    users ||--o{ api_keys : "владеет"
+    users ||--o{ sessions : "имеет"
+    users ||--|| rate_limits : "ограничен"
+    conversations ||--o{ messages : "содержит"
+    conversations ||--o{ inference_queue : "порождает"
+    inference_queue ||--|| streaming_buffer : "стримит в"
+    messages ||--o| usage_records : "тарифицируется"
+
+    users {
+        UUID user_id PK
+        VARCHAR email
+        VARCHAR password_hash
+        VARCHAR display_name
+        ENUM tier
+        TIMESTAMP created_at
+        TIMESTAMP updated_at
+    }
+
+    conversations {
+        UUID conv_id PK
+        UUID user_id FK
+        VARCHAR title
+        VARCHAR model
+        BOOLEAN is_archived
+        TIMESTAMP created_at
+        TIMESTAMP updated_at
+    }
+
+    messages {
+        UUID message_id PK
+        UUID conv_id FK
+        ENUM role
+        TEXT content
+        INT tokens_count
+        VARCHAR finish_reason
+        TIMESTAMP created_at
+    }
+
+    api_keys {
+        UUID key_id PK
+        UUID user_id FK
+        VARCHAR key_hash
+        VARCHAR key_prefix
+        VARCHAR name
+        BOOLEAN is_active
+        TIMESTAMP created_at
+        TIMESTAMP last_used_at
+    }
+
+    sessions {
+        UUID session_id PK
+        UUID user_id FK
+        VARCHAR token_hash
+        VARCHAR ip_address
+        VARCHAR user_agent
+        TIMESTAMP created_at
+        TIMESTAMP expires_at
+    }
+
+    usage_records {
+        UUID record_id PK
+        UUID user_id FK
+        UUID conv_id FK
+        UUID message_id FK
+        VARCHAR model
+        INT prompt_tokens
+        INT completion_tokens
+        INT total_tokens
+        DECIMAL cost
+        TIMESTAMP created_at
+    }
+
+    rate_limits {
+        UUID user_id PK
+        TIMESTAMP window_start
+        INT request_count
+        INT token_count
+        INT tier_limit_rps
+        INT tier_limit_tpm
+    }
+
+    inference_queue {
+        UUID request_id PK
+        UUID user_id
+        UUID conv_id
+        JSON prompt_payload
+        VARCHAR model
+        INT priority
+        ENUM status
+        TIMESTAMP created_at
+        TIMESTAMP started_at
+        TIMESTAMP completed_at
+    }
+
+    streaming_buffer {
+        UUID request_id FK
+        INT token_sequence
+        VARCHAR token_text
+        TIMESTAMP created_at
+    }
+```
+
+---
+
+## 5.2 Описание таблиц
+
+### users
+
+| Поле | Тип | Размер | Описание |
+| --- | --- | --- | --- |
+| user_id | UUID | 16 B | Первичный ключ |
+| email | VARCHAR | ~50 B | Email (уникальный) |
+| password_hash | VARCHAR | 60 B | bcrypt hash |
+| display_name | VARCHAR | ~50 B | Отображаемое имя |
+| tier | ENUM | 1 B | free / plus / enterprise |
+| created_at | TIMESTAMP | 8 B | Регистрация |
+| updated_at | TIMESTAMP | 8 B | Обновление |
+
+| Метрика | Значение |
+| --- | --- |
+| Строк | ~1 млрд |
+| Размер строки | ~200 B |
+| Общий объём | ~200 GB |
+| QPS чтение | 4 200 (auth) |
+| QPS запись | ~100 (регистрации) |
+| Консистентность | Strong |
+| Распределение ключей | Равномерное по user_id |
+
+---
+
+### conversations
+
+| Поле | Тип | Размер | Описание |
+| --- | --- | --- | --- |
+| conv_id | UUID | 16 B | Первичный ключ |
+| user_id | UUID | 16 B | Владелец |
+| title | VARCHAR | ~100 B | Название диалога |
+| model | VARCHAR | 20 B | Модель |
+| is_archived | BOOLEAN | 1 B | Флаг архивации |
+| created_at | TIMESTAMP | 8 B | Создание |
+| updated_at | TIMESTAMP | 8 B | Последнее сообщение |
+
+| Метрика | Значение |
+| --- | --- |
+| Строк | ~50 млрд |
+| Размер строки | ~170 B |
+| Общий объём | ~8.5 TB |
+| QPS чтение | 33 500 (21 000 список + 12 500 открытие) |
+| QPS запись | 29 000 (update при новом сообщении) |
+| Консистентность | Strong (per-user) |
+| Распределение ключей | Hot keys у активных пользователей |
+
+---
+
+### messages
+
+| Поле | Тип | Размер | Описание |
+| --- | --- | --- | --- |
+| message_id | UUID | 16 B | Первичный ключ |
+| conv_id | UUID | 16 B | FK → conversations |
+| role | ENUM | 1 B | user / assistant / system |
+| content | TEXT | ~1–4 KB | Текст сообщения |
+| tokens_count | INT | 4 B | Количество токенов |
+| finish_reason | VARCHAR | 10 B | stop / length / error |
+| created_at | TIMESTAMP | 8 B | Время создания |
+
+| Метрика | Значение |
+| --- | --- |
+| Строк | ~2.5 млрд/день, ~900 млрд/год |
+| Размер строки | ~2.5 KB (avg) |
+| Общий объём | ~12.5 TB/день, ~4.5 PB/год |
+| QPS чтение | 12 500 (загрузка диалога) |
+| QPS запись | 58 000 (prompt + response = 2 × 29 000) |
+| Консистентность | Eventual (допустим read-after-write delay) |
+| Распределение ключей | Hot keys по conv_id активных диалогов |
+
+---
+
+### api_keys
+
+| Поле | Тип | Размер | Описание |
+| --- | --- | --- | --- |
+| key_id | UUID | 16 B | Первичный ключ |
+| user_id | UUID | 16 B | FK → users |
+| key_hash | VARCHAR | 64 B | SHA-256 hash |
+| key_prefix | VARCHAR | 8 B | Префикс для идентификации |
+| name | VARCHAR | 50 B | Имя ключа |
+| is_active | BOOLEAN | 1 B | Активен ли |
+| created_at | TIMESTAMP | 8 B | Создание |
+| last_used_at | TIMESTAMP | 8 B | Последнее использование |
+
+| Метрика | Значение |
+| --- | --- |
+| Строк | ~100 млн |
+| Размер строки | ~180 B |
+| Общий объём | ~18 GB |
+| QPS чтение | 29 000 (валидация при каждом API-запросе) |
+| QPS запись | ~100 |
+| Консистентность | Strong |
+| Распределение ключей | Равномерное по key_hash |
+
+---
+
+### sessions
+
+| Поле | Тип | Размер | Описание |
+| --- | --- | --- | --- |
+| session_id | UUID | 16 B | Первичный ключ |
+| user_id | UUID | 16 B | FK → users |
+| token_hash | VARCHAR | 64 B | Hash токена |
+| ip_address | VARCHAR | 45 B | IPv4/IPv6 |
+| user_agent | VARCHAR | 200 B | User-Agent |
+| created_at | TIMESTAMP | 8 B | Создание |
+| expires_at | TIMESTAMP | 8 B | Истечение |
+
+| Метрика | Значение |
+| --- | --- |
+| Строк | ~360 млн (DAU) |
+| Размер строки | ~360 B |
+| Общий объём | ~130 GB |
+| QPS чтение | 95 700 (проверка на каждый запрос) |
+| QPS запись | 4 200 (login) |
+| Консистентность | Strong |
+| Распределение ключей | Равномерное по token_hash |
+
+---
+
+### usage_records
+
+| Поле | Тип | Размер | Описание |
+| --- | --- | --- | --- |
+| record_id | UUID | 16 B | Первичный ключ |
+| user_id | UUID | 16 B | FK → users |
+| conv_id | UUID | 16 B | FK → conversations |
+| message_id | UUID | 16 B | FK → messages |
+| model | VARCHAR | 20 B | Модель |
+| prompt_tokens | INT | 4 B | Токены промпта |
+| completion_tokens | INT | 4 B | Токены ответа |
+| total_tokens | INT | 4 B | Сумма |
+| cost | DECIMAL | 8 B | Стоимость |
+| created_at | TIMESTAMP | 8 B | Время |
+
+| Метрика | Значение |
+| --- | --- |
+| Строк | ~2.5 млрд/день |
+| Размер строки | ~120 B |
+| Общий объём | ~300 GB/день, ~110 TB/год |
+| QPS чтение | ~1 000 (billing dashboard) |
+| QPS запись | 29 000 |
+| Консистентность | Eventual |
+| Распределение ключей | Hot keys у активных пользователей |
+
+---
+
+### rate_limits
+
+| Поле | Тип | Размер | Описание |
+| --- | --- | --- | --- |
+| user_id | UUID | 16 B | PK |
+| window_start | TIMESTAMP | 8 B | Начало окна |
+| request_count | INT | 4 B | Счётчик запросов |
+| token_count | INT | 4 B | Счётчик токенов |
+| tier_limit_rps | INT | 4 B | Лимит RPS |
+| tier_limit_tpm | INT | 4 B | Лимит TPM |
+
+| Метрика | Значение |
+| --- | --- |
+| Строк | ~360 млн |
+| Размер строки | ~40 B |
+| Общий объём | ~15 GB |
+| QPS чтение | 29 000 |
+| QPS запись | 29 000 (атомарный инкремент) |
+| Консистентность | Strong (per-user) |
+| Распределение ключей | Hot keys у активных пользователей |
+
+---
+
+### inference_queue
+
+| Поле | Тип | Размер | Описание |
+| --- | --- | --- | --- |
+| request_id | UUID | 16 B | Первичный ключ |
+| user_id | UUID | 16 B | Инициатор |
+| conv_id | UUID | 16 B | Диалог |
+| prompt_payload | JSON | ~1–128 KB | Контекст для модели |
+| model | VARCHAR | 20 B | Модель |
+| priority | INT | 4 B | Приоритет |
+| status | ENUM | 1 B | queued / processing / done / failed |
+| created_at | TIMESTAMP | 8 B | Постановка |
+| started_at | TIMESTAMP | 8 B | Начало |
+| completed_at | TIMESTAMP | 8 B | Конец |
+
+| Метрика | Значение |
+| --- | --- |
+| Строк (in-flight) | ~1–2 млн |
+| Размер строки | ~10 KB avg |
+| Общий объём (горячий) | ~20 GB |
+| QPS чтение | 29 000 (scheduler consume) |
+| QPS запись | 29 000 (produce) |
+| Консистентность | Strong (ordering важен) |
+| Распределение ключей | Равномерное по request_id |
+
+---
+
+### streaming_buffer
+
+| Поле | Тип | Размер | Описание |
+| --- | --- | --- | --- |
+| request_id | UUID | 16 B | FK → inference_queue |
+| token_sequence | INT | 4 B | Порядковый номер |
+| token_text | VARCHAR | ~20 B | Текст токена |
+| created_at | TIMESTAMP | 8 B | Время генерации |
+
+| Метрика | Значение |
+| --- | --- |
+| Строк (in-flight) | ~700 млн |
+| Размер строки | ~50 B |
+| Общий объём (горячий) | ~35 GB |
+| QPS чтение | ~2 300 000 (SSE gateway reads) |
+| QPS запись | ~2 300 000 (GPU writes) |
+| Консистентность | Eventual (ordered by sequence) |
+| Распределение ключей | Hot keys по active request_id |
+| TTL | Auto-expire 5 мин |
+
+---
+
+## 5.3 Сводная таблица
+
+| Таблица | Строк | Размер строки | Объём | QPS Read | QPS Write | Консистентность |
+| --- | --- | --- | --- | --- | --- | --- |
+| users | 1 млрд | 200 B | 200 GB | 4 200 | 100 | Strong |
+| conversations | 50 млрд | 170 B | 8.5 TB | 33 500 | 29 000 | Strong (user) |
+| messages | 900 млрд/год | 2.5 KB | 4.5 PB/год | 12 500 | 58 000 | Eventual |
+| api_keys | 100 млн | 180 B | 18 GB | 29 000 | 100 | Strong |
+| sessions | 360 млн | 360 B | 130 GB | 95 700 | 4 200 | Strong |
+| usage_records | 900 млрд/год | 120 B | 110 TB/год | 1 000 | 29 000 | Eventual |
+| rate_limits | 360 млн | 40 B | 15 GB | 29 000 | 29 000 | Strong (user) |
+| inference_queue | 2 млн | 10 KB | 20 GB | 29 000 | 29 000 | Strong |
+| streaming_buffer | 700 млн | 50 B | 35 GB | 2 300 000 | 2 300 000 | Eventual |
+
+---
+
+# 6. Физическая схема БД
+
+## 6.1 Выбор СУБД
+
+| Таблица | СУБД | Обоснование |
+| --- | --- | --- |
+| users | PostgreSQL | Реляционные данные, strong consistency, малый объём |
+| conversations | PostgreSQL | Связь с users, strong consistency per-user |
+| messages | ScyllaDB | Огромный объём (PB/год), write-heavy, eventual consistency |
+| api_keys | PostgreSQL | Малый объём, strong consistency, частые lookups |
+| sessions | Redis | Высочайший QPS чтение (95k), TTL, key-value |
+| usage_records | ClickHouse | Append-only, аналитические агрегации, сжатие |
+| rate_limits | Redis | Атомарные инкременты, TTL, low latency |
+| inference_queue | Kafka | Message queue, ordering, высокий throughput |
+| streaming_buffer | Redis Streams | Pub/sub с ordering, TTL, low latency |
+
+---
+
+## 6.2 Схема с привязкой к СУБД и индексами
+
+### PostgreSQL Cluster
+
+```mermaid
+erDiagram
+    users {
+        UUID user_id PK "shard: hash(user_id) % 64"
+        VARCHAR email UK "IDX: B-tree UNIQUE"
+        VARCHAR password_hash
+        VARCHAR display_name
+        ENUM tier
+        TIMESTAMP created_at
+        TIMESTAMP updated_at
+    }
+
+    conversations {
+        UUID conv_id PK
+        UUID user_id FK "shard: hash(user_id) % 64"
+        VARCHAR title
+        VARCHAR model
+        BOOLEAN is_archived
+        TIMESTAMP created_at "IDX: (user_id, updated_at DESC)"
+        TIMESTAMP updated_at "IDX: (user_id, is_archived)"
+    }
+
+    api_keys {
+        UUID key_id PK
+        UUID user_id FK "shard: hash(user_id) % 64"
+        VARCHAR key_hash "IDX: B-tree"
+        VARCHAR key_prefix
+        VARCHAR name
+        BOOLEAN is_active
+        TIMESTAMP created_at
+        TIMESTAMP last_used_at
+    }
+
+    users ||--o{ conversations : ""
+    users ||--o{ api_keys : ""
+```
+
+### ScyllaDB
+
+```mermaid
+erDiagram
+    messages {
+        UUID conv_id PK "Partition Key"
+        TIMESTAMP created_at "Clustering Key DESC"
+        UUID message_id
+        TEXT role
+        TEXT content
+        INT tokens_count
+        TEXT finish_reason
+    }
+```
+
+### ClickHouse
+
+```mermaid
+erDiagram
+    usage_records {
+        UUID record_id
+        UUID user_id "ORDER BY (user_id, created_at)"
+        UUID conv_id
+        UUID message_id
+        String model "LowCardinality"
+        UInt32 prompt_tokens
+        UInt32 completion_tokens
+        UInt32 total_tokens
+        Decimal64 cost
+        DateTime created_at "PARTITION BY toYYYYMM()"
+    }
+```
+
+### Redis
+
+```mermaid
+graph LR
+    subgraph Redis["Redis Cluster"]
+        S["sessions<br/>Key: sess:{token_hash}<br/>Value: JSON<br/>TTL: 24h"]
+        R["rate_limits<br/>Key: rl:{user_id}<br/>Value: counters<br/>TTL: 60s"]
+        B["streaming_buffer<br/>Key: stream:{request_id}<br/>Type: Redis Stream<br/>TTL: 5 min"]
+    end
+```
+
+### Kafka
+
+```mermaid
+graph LR
+    subgraph Kafka["Kafka Cluster"]
+        T1["inference.requests<br/>Partitions: 256<br/>Key: user_id<br/>Retention: 24h"]
+        T2["inference.results<br/>Partitions: 256<br/>Retention: 1h"]
+        T3["inference.dlq<br/>Partitions: 16<br/>Retention: 7d"]
+    end
+```
+
+---
+
+## 6.3 Индексы
+
+| Таблица | Индекс | Тип | Обоснование |
+| --- | --- | --- | --- |
+| users | PK: user_id | B-tree | Primary lookup |
+| users | UNIQUE: email | B-tree | Login |
+| conversations | PK: conv_id | B-tree | Primary lookup |
+| conversations | (user_id, updated_at DESC) | B-tree | Список чатов с сортировкой |
+| conversations | (user_id, is_archived) | B-tree | Фильтр активных/архивных |
+| api_keys | PK: key_id | B-tree | Primary lookup |
+| api_keys | key_hash | B-tree | Валидация API-ключа |
+| api_keys | user_id | B-tree | Список ключей пользователя |
+| messages | Partition: conv_id | Hash | Все сообщения чата на одном узле |
+| messages | Clustering: created_at DESC | Sorted | Порядок внутри диалога |
+| usage_records | ORDER BY (user_id, created_at) | MergeTree | Агрегации по пользователю |
+| usage_records | PARTITION BY toYYYYMM(created_at) | Partition | Очистка старых данных |
+| sessions | KEY sess:{token_hash} | Hash | O(1) lookup |
+| rate_limits | KEY rl:{user_id} | Hash | O(1) lookup |
+| streaming_buffer | KEY stream:{request_id} | Stream | Ordered delivery |
+
+---
+
+## 6.4 Денормализация
+
+| Что | Где | Зачем |
+| --- | --- | --- |
+| title | conversations | Список чатов без JOIN к messages |
+| updated_at | conversations | Сортировка списка без scan messages |
+| tokens_count | messages | Без повторного tokenize при чтении |
+| model | conversations + usage_records | Фильтрация без JOIN |
+| total_tokens | usage_records | Быстрая агрегация без суммирования полей |
+| Materialized views | ClickHouse | Предагрегация для billing dashboard |
+
+---
+
+## 6.5 Шардирование и резервирование
+
+| СУБД | Shard Key | Шардов | Репликация | Нод |
+| --- | --- | --- | --- | --- |
+| PostgreSQL | hash(user_id) % 64 | 64 | 1 primary + 2 replicas | 192 |
+| ScyllaDB | Murmur3(conv_id) | auto | RF=3 per region | 48 |
+| Redis | CRC16 hash slots | 128 | 1 primary + 1 replica | 256 |
+| ClickHouse | hash(user_id) % 8 | 8 | 2 replicas per shard | 16 |
+| Kafka | hash(user_id) % 256 | 256 partitions | RF=3, Min ISR=2 | 12 |
+
+### Обоснование ключей шардирования
+
+| СУБД | Почему такой ключ |
+| --- | --- |
+| PostgreSQL | user_id — все данные пользователя на одном шарде, нет cross-shard JOIN |
+| ScyllaDB | conv_id — все сообщения диалога в одной партиции, типичный запрос: WHERE conv_id = ? |
+| Redis | Стандартный CRC16 по ключу, равномерное распределение |
+| ClickHouse | user_id — агрегации billing по пользователю без distributed join |
+| Kafka | user_id — ordering запросов одного пользователя внутри партиции |
+
+---
+
+## 6.6 Клиентские библиотеки и балансировка подключений
+
+| СУБД | Клиентская библиотека | Connection Pool / Proxy |
+| --- | --- | --- |
+| PostgreSQL | asyncpg (Python), pgx (Go) | PgBouncer (transaction mode) |
+| ScyllaDB | scylla-driver, gocql | Token-aware routing (built-in) |
+| Redis | redis-py, go-redis | Redis Cluster routing (built-in) |
+| ClickHouse | clickhouse-connect | HTTP interface, connection reuse |
+| Kafka | confluent-kafka, sarama | Built-in producer/consumer |
+
+### Балансировка запросов к PostgreSQL
+
+```mermaid
+graph TD
+    App["Application"] --> PgB["PgBouncer"]
+    PgB -->|"writes"| Primary["Primary"]
+    PgB -->|"reads"| R1["Replica 1"]
+    PgB -->|"reads"| R2["Replica 2"]
+```
+
+- **Writes** → Primary only
+- **Reads** → реплики через round-robin
+- PgBouncer в transaction mode, max 100 connections per pool
+
+---
+
+## 6.7 Схема резервного копирования
+
+| СУБД | Метод | Периодичность | Хранение | RPO | RTO |
+| --- | --- | --- | --- | --- | --- |
+| PostgreSQL | pg_basebackup + WAL archiving | Full: ежедневно, WAL: непрерывно | S3, 30 дней | < 1 мин | < 15 мин |
+| ScyllaDB | nodetool snapshot | Ежедневно | S3, 14 дней | < 1 час | < 1 час |
+| Redis | RDB + AOF | RDB: ежечасно, AOF: always | S3, 7 дней | < 1 сек | < 5 мин |
+| ClickHouse | BACKUP TABLE → S3 | Ежедневно | S3, 90 дней | < 24 часа | < 1 час |
+| Kafka | MirrorMaker 2 | Непрерывно | Второй кластер | < 1 сек | < 1 мин |
+
+*Примечание: streaming_buffer (Redis Streams) не бэкапится — данные эфемерные с TTL 5 минут.*
+
+---
+
+## 6.8 Сводная таблица физической схемы
+
+| Таблица | СУБД | Shard Key | Шардов | Реплик | Нод | Ключевые индексы |
+| --- | --- | --- | --- | --- | --- | --- |
+| users | PostgreSQL | hash(user_id) | 64 | 3 | 192 | PK user_id, UNIQUE email |
+| conversations | PostgreSQL | hash(user_id) | 64 | 3 | * | PK conv_id, IDX (user_id, updated_at) |
+| messages | ScyllaDB | Murmur3(conv_id) | auto | 3 | 48 | Partition conv_id, Cluster created_at |
+| api_keys | PostgreSQL | hash(user_id) | 64 | 3 | * | PK key_id, IDX key_hash |
+| sessions | Redis | CRC16 | 128 | 2 | 256 | KEY sess:{token_hash} |
+| rate_limits | Redis | CRC16 | * | 2 | * | KEY rl:{user_id} |
+| streaming_buffer | Redis Streams | CRC16 | * | 2 | * | KEY stream:{request_id} |
+| usage_records | ClickHouse | hash(user_id) | 8 | 2 | 16 | ORDER BY (user_id, created_at) |
+| inference_queue | Kafka | hash(user_id) | 256 | 3 | 12 | Topic partitioning |
+
+*\* — colocation: размещены на тех же нодах что и основные данные Redis / PostgreSQL*
+
 # Источники
 
 [^1]: OpenAI. *ChatGPT usage and adoption patterns at work.* https://openai.com/business/guides-and-resources/chatgpt-usage-and-adoption-patterns-at-work/
@@ -737,3 +1441,7 @@ GPU inference нельзя балансировать как обычные HTTP
 [^4]: Exploding Topics. *ChatGPT Users Statistics.* https://explodingtopics.com/blog/chatgpt-users
 
 [^5]: OpenAI. *Data Residency.* https://openai.com/enterprise-privacy/data-residency/
+
+[^6]: Nginx Blog. *Testing Performance of NGINX Ingress Controller for Kubernetes.* https://blog.nginx.org/blog/testing-performance-nginx-ingress-controller-kubernetes
+
+[^7]: Nginx Blog. *Testing the Performance of NGINX and NGINX Plus Web Servers.* https://blog.nginx.org/blog/testing-the-performance-of-nginx-and-nginx-plus-web-servers
