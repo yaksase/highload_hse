@@ -208,6 +208,10 @@
 
 Когда выносишь блок в `defense-cheatsheet.md` — оставляй в README HTML-комментарий-маяк (`<!-- ... в notes/defense-cheatsheet.md -->`), чтобы при следующей правке агент видел, что блок не потерян, а сознательно перенесён.
 
+**README — итоговый документ.** В нём не должно быть видимых упоминаний `notes/`, `defense-cheatsheet`, `section-7-10-drafts`. Ни в тексте, ни в Mermaid-диаграммах, ни в таблицах. Комментарии-маяки — только в HTML-комментариях (`<!-- -->`). Если в РПЗ нужна ссылка «подробнее», то это либо на другую секцию того же документа (`см. §X.Y`), либо на внешний источник в `[^N]`.
+
+**Минимизация текста.** Узкие технические нюансы, которые «хорошо знать на защите», но не нужны для understanding РПЗ, — уезжают в `defense-cheatsheet.md`. Каждый абзац в РПЗ должен отвечать на конкретное требование из `requirements/homework_architecture.md`; если ответ можно дать таблицей — пишем таблицу, не прозу.
+
 ### §4 (Локальная балансировка)
 
 Расчёт балансировщиков должен иметь **минимум два ограничителя**: пропускная способность сети и SSL/TLS termination (CPS). Используй источники [`blog.nginx.org`](https://blog.nginx.org/blog/testing-the-performance-of-nginx-and-nginx-plus-web-servers) и [`blog.nginx.org/.../nginx-ingress-controller-kubernetes`](https://blog.nginx.org/blog/testing-performance-nginx-ingress-controller-kubernetes) — они в требованиях курса.
@@ -215,8 +219,26 @@
 ### §5/§6 (БД)
 
 - В логической схеме (§5) указывай размер строки, QPS чтения/записи, требования к консистентности, особенности распределения ключей.
+- **§5 — database-agnostic.** Никаких упоминаний Redis, PG, Scylla, ClickHouse в карточках таблиц. Поля `(внутри Hash)`, «Redis-ключ», «в RAM» — всё это §6. Тот же принцип для алгоритмов хранения и репликации.
 - В физической схеме (§6) — конкретную СУБД с обоснованием, индексы, шардирование, репликацию, бэкапы.
-- Не теряй сущности: файлы/blob-данные (S3), кэши (Redis), очереди — всё это часть БД-картины.
+- Не теряй сущности: файлы/blob-данные (Ceph RGW / S3), кэши (Redis), очереди — всё это часть БД-картины.
+
+### Версионируемые справочники (tier, model, …)
+
+- Справочники с **бизнес-атрибутами** (цены, лимиты) делаем **версионируемыми**: PK — UUID, плюс поле `effective_to TIMESTAMP NULL`.
+- При смене цены/лимита: INSERT новой строки с новым UUID + UPDATE старой `effective_to = NOW()`. Запрещено UPDATE-ить атрибуты «на месте» — это сломает исторические `usage_records`, ссылающиеся на этот ID.
+- Human-readable код (`tier_code`, `model_code`) — обычный VARCHAR-атрибут, **не PK**. У одного кода может быть несколько ценовых версий. Для lookup «текущая версия по коду» — partial-индекс `WHERE effective_to IS NULL`.
+
+### Multi-currency
+
+- MVP — только USD. Поля `currency` в `billing_accounts` и `price_*` в справочниках — без указания валюты.
+- Multi-currency требует отдельного FX-rates-сервиса и conversion-time pricing с аудитом — это самостоятельный модуль, не часть базовой схемы.
+
+### Объектное хранилище
+
+- Целевое хранилище blob-данных — **Ceph RGW** (self-hosted, S3-compatible). Поля `s3_bucket` / `s3_key` сохраняем — это нейминг S3 API.
+- Managed AWS S3 не подходит на нашем объёме (десятки ПБ/год): стоимость хранения и egress сопоставима с GPU-парком. MinIO исключён — основной репозиторий переведён в read-only в начале 2026.
+- Erasure Coding (например, 8+3) предпочтительнее ×3 replication — overhead ×1.375 vs ×3 при сравнимой durability на наших объёмах.
 
 **Обязательные блоки §5:**
 
@@ -243,6 +265,32 @@
 - Различай `Partition Key` (определяет ноду) и `Clustering Key` (порядок строк внутри партиции). В таблице полей помечай оба.
 - Запрещай в API запросы без partition key (full scan по всем партициям — антипаттерн, явно указывай).
 - Объясняй формат clustering key (DESC vs ASC, tiebreaker — например, `(created_at DESC, message_id)`).
+- Альтернативные точки доступа (например, по `request_id` при partition key `conv_id`) — через **Materialized View**, а не Secondary Index (последний даёт scatter-gather).
+
+### ENUM vs справочник: критерий выбора
+
+При появлении категориального поля проверяй по правилу **«есть ли у значения бизнес-атрибуты?»**:
+
+| У значения есть атрибуты (цена, лимит, max_context) | Решение |
+| --- | --- |
+| Да (`tier`, `model`, `pricing_plan`) | **Справочник** в PG, FK по коду (`tier_code`, `model_code`). Single source of truth, изменения без миграции кода |
+| Нет (`role`, `status`, `channel`, `finish_reason`) | **ENUM** (PG ENUM или CHECK), `LowCardinality(String)` в ClickHouse, TEXT в Scylla |
+| Open-ended коды, добавляются кодом (`event_type`) | **VARCHAR** (PG) или `LowCardinality(String)` (CH) — справочник пришлось бы синхронизировать с релизами |
+
+Антипаттерны:
+- Тотальная нормализация всех ENUM-ов в lookup-таблицы — в Scylla убивает single-partition-read pattern (JOIN-ов нет), в ClickHouse дублирует то, что бесплатно даёт `LowCardinality`.
+- Дублирование `tier` в нескольких таблицах (например, в `users` и `billing_accounts`) — один из них устареет, поле должно быть в **одной** таблице, FK везде. Биллинг хранит только деньги, тариф — на user.
+- Хранение `tier_limit_rps` / `price_per_token` в каждой строке (вместо справочника) — UPDATE миллионов строк при изменении лимита/цены.
+
+### Трассировка request → response в БД
+
+Для inference-цикла (или любого многоэтапного запроса, который порождает 2+ записей в разных таблицах):
+
+1. **`request_id`** (correlation ID) — UUID, генерируется на edge, идёт в `X-Request-ID` HTTP-header, кладётся **в каждую** связанную запись (`messages`, `usage_records`, `attachments`). Совпадает с `trace_id` в Tempo/Jaeger — даёт сквозной audit от HTTP до GPU worker.
+2. **`parent_message_id`** (self-FK в `messages`) — `assistant.parent_message_id = user.message_id`. Закрывает regenerate, branching, edit. Без него «какой именно ответ на какой prompt» восстанавливается только эвристикой по `created_at`.
+3. Lookup по `request_id` в Scylla — через **Materialized View** (`messages_by_request`); в ClickHouse — skipping index (`bloom_filter`); в PG — обычный B-tree.
+
+Без этих полей цепочка «promtp → response» держится только на `(conv_id, created_at, role)` ordering — это ломается при race / regenerate / branching и не даёт audit «покажи мне всю обработку запроса X».
 
 ### Аббревиатуры и DB-термины: расшифровка при первом использовании
 

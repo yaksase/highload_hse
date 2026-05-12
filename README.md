@@ -78,7 +78,7 @@ Web и API — два разных профиля нагрузки: web — ко
 * **Auth** — пользователю выдается идентификатор (кука Session_id для web, API токен для API), который живет 1 месяц. На каждый запрос от пользователя, бэкенду нужно сходить в Auth Service.
 * **Лимитирование запросов** — отдельный сервис Rate Limiting Service, который лимитирует запросы для конкретного пользователя
 * **Client-side image compression** — web/mobile-клиент ресайзит фото до ~1280×1280 и пережимает в JPEG q=80 перед upload-ом (как WhatsApp/iMessage). Финальный resize до 1024×1024 для vision-encoder делает GPU worker. Документы (PDF/DOCX/PPTX) идут «как есть».
-* **Хранение вложений только в исходном виде** — в S3 лежит оригинал блоба, эмбеддинги картинок не кэшируются
+* **Хранение вложений только в исходном виде** — в объектном хранилище лежит оригинал блоба, эмбеддинги картинок не кэшируются
 
 # 2. Расчёт нагрузки
 
@@ -269,10 +269,10 @@ API даёт чуть больше concurrent SSE, чем Web — больше R
 | ------------------ | ----------------------------------------------------- | --------------------------- |
 | `chat.llm.com`     | Web-чат: HTTP + SSE                                   | Все 4 ДЦ (Anycast IP)       |
 | `api.llm.com`      | HTTP API для разработчиков: HTTP + SSE                | Все 4 ДЦ (Anycast IP)       |
-| `attach.llm.com`   | API выдачи presigned URL для S3 (загрузка/скачивание) | Все 4 ДЦ (Anycast IP)       |
+| `attach.llm.com`   | API выдачи presigned URL для объектного хранилища (загрузка/скачивание) | Все 4 ДЦ (Anycast IP)       |
 | `cdn.llm.com`      | Статика (JS/CSS, assets)                              | Внешний CDN-провайдер (CNAME) |
 
-Три первых домена резолвятся в **один общий Anycast IP** — гео-разделение по ДЦ происходит на сетевом уровне через BGP (см. §3.4–§3.5), а не в DNS. Сами бинарники вложений лежат в S3 и качаются по presigned URL напрямую с S3-эндпоинтов, через нашу инфраструктуру не проходят.
+Три первых домена резолвятся в **один общий Anycast IP** — гео-разделение по ДЦ происходит на сетевом уровне через BGP (см. §3.4–§3.5), а не в DNS. Сами бинарники вложений лежат в нашем Ceph RGW и качаются по presigned URL напрямую с региональных RGW-эндпоинтов.
 
 ---
 
@@ -340,7 +340,7 @@ Latency на это **не влияет**: RTT EU/APAC↔US-GPU 80–150 мс �
 | `chat.llm.com`    | A      | `192.0.2.10`                      | Anycast IP, общий для всех 4 ДЦ                 |
 | `api.llm.com`     | A      | `192.0.2.10`                      | Anycast IP, общий для всех 4 ДЦ                 |
 | `cdn.llm.com`     | CNAME  | `static.cdn-provider.net`         | Статика (JS/CSS) — внешний CDN                  |
-| `attach.llm.com`  | A      | `192.0.2.10`                      | Anycast IP — выдача presigned URL → S3          |
+| `attach.llm.com`  | A      | `192.0.2.10`                      | Anycast IP — выдача presigned URL → Ceph RGW    |
 | `llm.com`         | NS     | 4 anycast-адреса authoritative NS | Сами NS-сервера тоже на anycast (RFC 7094)      |
 
 TTL A-записей — 60 сек (для миграции Anycast-провайдера / IP-блока), DNSSEC включён.
@@ -360,10 +360,6 @@ flowchart TD
 ```
 
 > **Граница раздела.** Глобальная балансировка (§3) заканчивается там, где Anycast-пакет попал в нужный ДЦ. Что происходит дальше — TLS termination, SNI routing по `Host`, выбор Nginx-ноды, distribution по backend pods — это локальная балансировка, **§4**. ASN `64500` — пример из приватного диапазона RFC 6996; в проде у нас был бы зарегистрированный публичный ASN.
-
-<!-- Контр-аргументы для устной защиты («зачем Anycast, а не GeoDNS», DDoS-распределение,
-     проблема геолокации мобильных resolver-ов и т.п.) — в notes/defense-cheatsheet.md.
-     В РПЗ оставляем минимально достаточный текст; всё остальное — на защиту устно. -->
 
 ---
 
@@ -423,15 +419,22 @@ flowchart TD
 
 ---
 
-<!-- §3.6+ (inference flow, multimodal pull, Rate Limiter / Billing placement)
-     перенесены в notes/section-7-10-drafts.md — материал относится к §7 (Алгоритмы)
-     и §10 (Схема проекта), не к глобальной балансировке. -->
-
 # 4. Локальная балансировка нагрузки
 
 §4 — про балансировку **внутри одного ДЦ**: что происходит после того, как Anycast-пакет приземлился на пул edge-нод (§3.4). Граница с §3 — на входной IP ДЦ; граница с §6 — БД балансятся отдельным механизмом и описаны в §6.
 
 ## 4.1 Слои балансировки внутри ДЦ
+
+**Платформа.** Все stateless-сервисы (`ingress-nginx`, `api-gateway`, `chat`, `regional-inference`) живут в **Kubernetes** (далее «k8s») — open-source оркестраторе контейнеров. В локальной балансировке используем 4 подсистемы k8s:
+
+| Подсистема k8s | Что даёт балансировке | Где детально |
+| --- | --- | --- |
+| `Service` + `ClusterIP` + `kube-proxy` (IPVS) | Виртуальный IP на группу одинаковых контейнеров (Pod-ов), L4-балансировка round-robin внутри кластера | §4.1 (эта таблица), §4.5 |
+| `DaemonSet` | Контроллер, который размещает ingress-nginx ровно по одной реплике на каждой edge-ноде — без ручного planning'а | §4.2 |
+| `readiness` / `liveness probe` | k8s сам исключает упавший Pod из `Service` endpoints и перезапускает зависший — отдельный service-discovery (Consul / etcd) поверх k8s не нужен (цитата из лекции про оркестрацию) | §4.4 |
+| `HPA` (Horizontal Pod Autoscaler) | Авто-масштабирование числа upstream-Pod-ов по CPU — закрывает дневные / недельные колебания нагрузки без операторской работы | §4.4 |
+
+`MetalLB` и `ingress-nginx` — **не** часть k8s, это отдельные компоненты, установленные поверх (через Helm). Связка: оба запускаются как DaemonSet, оба используют k8s API для service discovery. Stateful-сервисы (PostgreSQL, ScyllaDB, ClickHouse, Redis) в k8s **не** живут — это отдельные кластеры на bare-metal нодах со своими механизмами балансировки и репликации (см. §6).
 
 В ДЦ есть три места, где принимается решение «на какой инстанс отправить запрос»:
 
@@ -476,7 +479,7 @@ flowchart LR
 | Параметр | API upstream | SSE upstream | Зачем |
 | --- | --- | --- | --- |
 | `load-balance` | `least_conn` | `ewma` | API — короткие однородные запросы; SSE — длинные стримы, `ewma` (exponentially weighted moving average по latency) учитывает «тяжесть» бэкенда |
-| `affinity` | off | off | Sticky sessions выключены: SSE-стрим = одно соединение = один pod автоматически. Resume по `Last-Event-ID` в MVP не реализуем (см. defense-cheatsheet) |
+| `affinity` | off | off | Sticky sessions выключены: SSE-стрим = одно соединение = один pod автоматически. Resume по `Last-Event-ID` в MVP не реализуем |
 | `proxy-read-timeout` | 30 сек | 300 сек | Из лекции: «разные настройки для разных типов запросов» — длинный таймаут только там, где он нужен |
 | `proxy-buffering` | on | **off** | Буферизация SSE убила бы стриминг токенов |
 | `keepalive` (upstream) | 128 | 32 | TCP multiplexing к upstream, экономит TCP/TLS-handshake между ingress и Pod |
@@ -486,7 +489,7 @@ flowchart LR
 
 **TLS termination на ingress:** TLS 1.3, ECDSA P-256, session tickets включены (60–70% reuse в реальных профилях [^14]), Let's Encrypt через cert-manager. Session cache в shared memory ingress-а — этого хватает, потому что Anycast уже привязал клиента к одному ДЦ (§3.4), и в большинстве случаев он попадает на один и тот же edge-pod.
 
-**Почему ingress-nginx (open-source), а не Nginx Plus:** для MVP всё нужное (TLS, HTTP/2, `least_conn`, `ewma`, proxy_next_upstream, sticky cookie) есть в open-source — Plus-фичи (`least_time`, live-activity API, JWT validation) добавили бы ~$30k/год за лицензии без качественного перехода. Аргументы для устной защиты — в `notes/defense-cheatsheet.md`.
+**Почему ingress-nginx (open-source), а не Nginx Plus:** для MVP всё нужное (TLS, HTTP/2, `least_conn`, `ewma`, proxy_next_upstream, sticky cookie) есть в open-source — Plus-фичи (`least_time`, live-activity API, JWT validation) добавили бы ~$30k/год за лицензии без качественного перехода.
 
 **Что НЕ делает ingress-nginx:** не балансит intra-cluster трафик (это `kube-proxy`), не балансит gRPC между сервисами (это client-side LB), не балансит запросы к БД (это PgBouncer / driver, см. §6).
 
@@ -498,7 +501,7 @@ flowchart LR
 
 ### Исходные данные
 
-Из §3.3 (пиковый трафик per-region) и §2.3 (сетевой трафик через ingress, без вложений — они идут напрямую в S3 по presigned URL):
+Из §3.3 (пиковый трафик per-region) и §2.3 (сетевой трафик через ingress, без вложений — они идут напрямую в Ceph RGW по presigned URL):
 
 ```
 Через ingress peak (global):
@@ -632,23 +635,50 @@ $$N_{min} = \max(N_{rps}, N_{cps}, N_{net}); \qquad N_{total} = 2 \times N_{min}
 
 ```mermaid
 erDiagram
+    subscription_tiers ||--o{ users : "тариф"
+    models ||--o{ messages : "сгенерировано (assistant)"
+    models ||--o{ usage_records : "billed by"
     users ||--o{ conversations : "создаёт"
     users ||--o{ api_keys : "владеет"
     users ||--o{ sessions : "имеет"
     users ||--|| rate_limits : "ограничен"
     users ||--|| billing_accounts : "оплачивает"
     conversations ||--o{ messages : "содержит"
+    messages ||--o| messages : "отвечает на (parent)"
     messages ||--o{ attachments : "прикрепляет"
     messages ||--o| usage_records : "тарифицируется"
     billing_accounts ||--o{ usage_records : "агрегирует"
     users ||--o{ audit_log : "логируется"
+
+    subscription_tiers {
+        UUID tier_id PK
+        VARCHAR tier_code
+        VARCHAR display_name
+        DECIMAL price_monthly
+        INT rps_limit
+        INT tpm_limit
+        INT context_limit
+        TIMESTAMP effective_from
+        TIMESTAMP effective_to
+    }
+
+    models {
+        UUID model_id PK
+        VARCHAR model_code
+        DECIMAL price_input_per_1k
+        DECIMAL price_output_per_1k
+        INT max_context
+        BOOLEAN supports_vision
+        TIMESTAMP effective_from
+        TIMESTAMP effective_to
+    }
 
     users {
         UUID user_id PK
         VARCHAR email
         VARCHAR password_hash
         VARCHAR display_name
-        ENUM tier
+        UUID tier_id FK
         TIMESTAMP created_at
         TIMESTAMP updated_at
     }
@@ -657,7 +687,6 @@ erDiagram
         UUID conv_id PK
         UUID user_id FK
         VARCHAR title
-        VARCHAR model
         BOOLEAN is_archived
         TIMESTAMP created_at
         TIMESTAMP updated_at
@@ -666,7 +695,10 @@ erDiagram
     messages {
         UUID message_id PK
         UUID conv_id FK
+        UUID parent_message_id FK
+        UUID request_id
         ENUM role
+        UUID model_id FK
         TEXT content
         INT tokens_count
         VARCHAR finish_reason
@@ -681,15 +713,11 @@ erDiagram
         VARCHAR name
         BOOLEAN is_active
         TIMESTAMP created_at
-        TIMESTAMP last_used_at
     }
 
     sessions {
-        UUID session_id PK
+        VARCHAR token_hash PK
         UUID user_id FK
-        VARCHAR token_hash
-        VARCHAR ip_address
-        VARCHAR user_agent
         TIMESTAMP created_at
         TIMESTAMP expires_at
     }
@@ -699,10 +727,11 @@ erDiagram
         UUID user_id FK
         UUID conv_id FK
         UUID message_id FK
-        VARCHAR model
+        UUID request_id
+        UUID model_id FK
+        ENUM channel
         INT prompt_tokens
         INT completion_tokens
-        INT total_tokens
         DECIMAL cost
         TIMESTAMP created_at
     }
@@ -712,16 +741,12 @@ erDiagram
         TIMESTAMP window_start
         INT request_count
         INT token_count
-        INT tier_limit_rps
-        INT tier_limit_tpm
     }
 
     billing_accounts {
         UUID user_id PK
-        ENUM tier
         DECIMAL balance
         DECIMAL reserved
-        VARCHAR currency
         TIMESTAMP updated_at
     }
 
@@ -729,11 +754,10 @@ erDiagram
         UUID attachment_id PK
         UUID message_id FK
         UUID user_id FK
+        UUID request_id
         VARCHAR s3_bucket
         VARCHAR s3_key
         VARCHAR mime_type
-        BIGINT size_bytes
-        VARCHAR sha256
         ENUM status
         TIMESTAMP created_at
     }
@@ -751,22 +775,76 @@ erDiagram
 
 ## 5.2 Связка inference-цикла
 
-Один HTTP-запрос на чат (`POST /v1/chat/completions` или Web-эквивалент) порождает **один inference-цикл** — пара «вопрос → ответ». В долговременное хранилище уходит:
+Один HTTP-запрос на чат (`POST /v1/chat/completions` или Web-эквивалент) порождает **один inference-цикл** — пара «вопрос → ответ». Все следы цикла связываются двумя идентификаторами:
 
-| След в БД | Кол-во на 1 цикл | Что хранится |
+* **`request_id`** — UUID, генерируется на edge, кладётся в `X-Request-ID` HTTP-ответа. Один и тот же на всех записях цикла: 2 строки `messages` + 1 `usage_records` + N `attachments`.
+* **`parent_message_id`** — self-FK внутри `messages`. У `role=assistant` указывает на `message_id` соответствующего `role=user`. Превращает диалог в дерево (закрывает regenerate и branching).
+
+| След | Кол-во на 1 цикл | Связь |
 | --- | --- | --- |
-| `messages` (Web) | **2 строки** | `role=user` (промпт) + `role=assistant` (ответ модели). Связаны общим `conv_id`, упорядочены по `created_at`. API-канал stateless и в `messages` не пишет |
-| `usage_records` | **1 строка** | `prompt_tokens`, `completion_tokens`, `cost`, `model`. Ссылается на `message_id` финального assistant-сообщения для аудита |
-| `attachments` (опц.) | 0 или N строк | Только если запрос мультимодальный; одна строка на каждый загруженный файл, FK на `message_id` пользовательского сообщения |
-| `audit_log` | 0–1 строк | Только для значимых событий (превышение лимита, billing-резерв) — не пишется на каждый успешный цикл |
+| `messages` (Web) | 2 строки: `role=user` + `role=assistant` | общий `request_id`; `assistant.parent_message_id = user.message_id` |
+| `usage_records` | 1 строка | `request_id`, `message_id` = assistant |
+| `attachments` | 0 или N строк | `request_id`, `message_id` = user |
+| `audit_log` | 0–1 строк (значимые события) | `request_id` в `payload` |
 
-Само in-flight состояние цикла (`request_id → GPU worker`, контекст промпта в памяти, поток токенов в gRPC stream) **не хранится в БД** — живёт в памяти Inference Scheduler (in-memory + Raft-журнал для **HA**, High Availability) и Regional Inference Service. Переживает не дольше длительности стрима; при сбое клиент ретраит. Детали потока — `notes/section-7-10-drafts.md` (переедут в §7/§10).
-
-Порядок записи (после закрытия SSE): `messages.user` фиксируется в начале цикла (до GPU), `messages.assistant` — после получения финального токена. `usage_records` пишется параллельно с финализацией `billing_accounts`. Подробная диаграмма потока — в §6.3.
+In-flight-состояние цикла (какой GPU обслуживает, контекст промпта, поток токенов) **в БД не пишется** — оно живёт в памяти inference-сервиса и в открытом сетевом соединении, переживает не дольше длительности стрима. При сбое клиент ретраит с тем же `request_id` для идемпотентности.
 
 ---
 
 ## 5.3 Описание таблиц
+
+### subscription_tiers (справочник)
+
+Версионируемый справочник тарифов. PK — `tier_id` UUID; при изменении цены или лимитов создаётся **новая** строка с новым `tier_id`, у старой проставляется `effective_to = NOW()`. Все исторические `usage_records`, ссылающиеся на старый `tier_id`, продолжают видеть старые цифры — аналитика по выручке не ломается.
+
+| Поле | Тип | Размер | Описание |
+| --- | --- | --- | --- |
+| tier_id | UUID | 16 B | PK |
+| tier_code | VARCHAR | ~10 B | Human-readable код: `'free'` / `'plus'` / `'pro'` / `'max'` / `'api'` (не уникальный — у одного кода может быть несколько версий) |
+| display_name | VARCHAR | ~30 B | Название для UI и invoice |
+| price_monthly | DECIMAL(10,2) | 8 B | USD / месяц; 0 для free и api |
+| rps_limit | INT | 4 B | Макс. RPS per-user |
+| tpm_limit | INT | 4 B | Tokens-per-minute лимит |
+| context_limit | INT | 4 B | Макс. tokens в одном промпте |
+| effective_from | TIMESTAMP | 8 B | Когда введён |
+| effective_to | TIMESTAMP | 8 B | NULL для активного; дата — для архивных версий |
+
+| Метрика | Значение |
+| --- | --- |
+| Строк | ~50 (5 активных × ~10 версий за всё время) |
+| Размер строки | ~100 B |
+| Общий объём | < 5 КБ |
+| QPS чтение | ~10 (миссы кеша; горячие данные на стороне Rate Limiter) |
+| QPS запись | < 0.1 |
+| Консистентность | Strong |
+
+---
+
+### models (справочник)
+
+Версионируемый справочник моделей. PK — `model_id` UUID; при изменении цены создаётся новая запись с новым `model_id`, у старой проставляется `effective_to = NOW()`. Это сохраняет историческую корректность `usage_records.cost`.
+
+| Поле | Тип | Размер | Описание |
+| --- | --- | --- | --- |
+| model_id | UUID | 16 B | PK |
+| model_code | VARCHAR | ~30 B | Human-readable: `'llama-3.1-70b'`, `'mistral-large'`, … (не уникальный — у одной модели может быть несколько ценовых версий) |
+| price_input_per_1k | DECIMAL(10,6) | 8 B | USD за 1k tokens промпта |
+| price_output_per_1k | DECIMAL(10,6) | 8 B | USD за 1k tokens ответа |
+| max_context | INT | 4 B | Лимит контекста |
+| supports_vision | BOOLEAN | 1 B | Принимает ли мультимодальный вход |
+| effective_from | TIMESTAMP | 8 B | Когда введена версия |
+| effective_to | TIMESTAMP | 8 B | NULL для активной |
+
+| Метрика | Значение |
+| --- | --- |
+| Строк | ~100 (10 активных × ~10 версий за всё время) |
+| Размер строки | ~130 B |
+| Общий объём | ~13 КБ |
+| QPS чтение | ~10 (миссы кеша; горячие данные на стороне Chat Service) |
+| QPS запись | < 0.1 |
+| Консистентность | Strong |
+
+---
 
 ### users
 
@@ -776,7 +854,7 @@ erDiagram
 | email | VARCHAR | ~50 B | Email (уникальный) |
 | password_hash | VARCHAR | 60 B | bcrypt hash |
 | display_name | VARCHAR | ~50 B | Отображаемое имя |
-| tier | ENUM | 1 B | free / plus / enterprise |
+| tier_id | UUID | 16 B | FK → `subscription_tiers.tier_id` (текущая версия тарифа) |
 | created_at | TIMESTAMP | 8 B | Регистрация |
 | updated_at | TIMESTAMP | 8 B | Обновление |
 
@@ -799,7 +877,6 @@ erDiagram
 | conv_id | UUID | 16 B | Первичный ключ |
 | user_id | UUID | 16 B | Владелец |
 | title | VARCHAR | ~100 B | Название диалога |
-| model | VARCHAR | 20 B | Модель |
 | is_archived | BOOLEAN | 1 B | Флаг архивации |
 | created_at | TIMESTAMP | 8 B | Создание |
 | updated_at | TIMESTAMP | 8 B | Последнее сообщение |
@@ -807,8 +884,8 @@ erDiagram
 | Метрика | Значение |
 | --- | --- |
 | Строк | ~50 млрд |
-| Размер строки | ~170 B |
-| Общий объём | ~8.5 TB |
+| Размер строки | ~140 B |
+| Общий объём | ~7.0 TB |
 | QPS чтение | 33 500 avg / 67 000 peak (21 000 список + 12 500 открытие) |
 | QPS запись | 28 935 avg / 57 870 peak (update updated_at при новом сообщении = Web inference RPS) |
 | Консистентность | Strong (per-user) |
@@ -822,7 +899,10 @@ erDiagram
 | --- | --- | --- | --- |
 | message_id | UUID | 16 B | Первичный ключ |
 | conv_id | UUID | 16 B | FK → conversations |
+| parent_message_id | UUID NULL | 16 B | Self-FK → `messages.message_id`. У `role=assistant` — указывает на свой `role=user`. У `role=user` — NULL (или предыдущий assistant в multi-turn). Закрывает regenerate и branching |
+| request_id | UUID | 16 B | Correlation ID одного inference-цикла. Совпадает с `X-Request-ID` HTTP-ответа, `trace_id` в Tempo. Одинаковый у user и assistant пары |
 | role | ENUM | 1 B | user / assistant / system |
+| model_id | UUID NULL | 16 B | FK → `models.model_id` (конкретная ценовая версия). Заполнен только для `role=assistant`; NULL для user |
 | content | TEXT | ~1–4 KB | Текст сообщения |
 | tokens_count | INT | 4 B | Количество токенов |
 | finish_reason | VARCHAR | 10 B | stop / length / error |
@@ -832,8 +912,8 @@ erDiagram
 | --- | --- |
 | Строк | ~5 млрд/день, ~1.83 трлн/год (1 inference-цикл Web = 2 строки: `role=user` + `role=assistant`; API stateless, не пишет) |
 | Размер строки | ~2.5 KB (avg) |
-| Общий объём | ~12.5 TB/день, ~4.5 PB/год |
-| QPS чтение | 12 500 avg / 25 000 peak (загрузка диалога при открытии) |
+| Общий объём | ~12.5 TB/день, ~4.57 PB/год |
+| QPS чтение | 12 500 avg / 25 000 peak (загрузка диалога при открытии) + редкие точечные `WHERE request_id=?` (audit, support) |
 | QPS запись | 57 870 avg / 115 740 peak (Web inference avg 28 935 × 2 messages) |
 | Консистентность | Eventual (read-after-write delay допустим: пользователь видит свой prompt и ответ из памяти стрима до фиксации) |
 | Распределение ключей | Hot-partitions у активных диалогов; внутри партиции — равномерно по `created_at`. Подробно — §5.4 |
@@ -847,19 +927,18 @@ erDiagram
 | key_id | UUID | 16 B | Первичный ключ |
 | user_id | UUID | 16 B | FK → users |
 | key_hash | VARCHAR | 64 B | SHA-256 hash |
-| key_prefix | VARCHAR | 8 B | Префикс для идентификации |
+| key_prefix | VARCHAR | 8 B | Префикс для идентификации (видимая часть, e.g. `sk-abc...`) |
 | name | VARCHAR | 50 B | Имя ключа |
 | is_active | BOOLEAN | 1 B | Активен ли |
 | created_at | TIMESTAMP | 8 B | Создание |
-| last_used_at | TIMESTAMP | 8 B | Последнее использование |
 
 | Метрика | Значение |
 | --- | --- |
 | Строк | ~100 млн |
-| Размер строки | ~180 B |
-| Общий объём | ~18 GB |
+| Размер строки | ~170 B |
+| Общий объём | ~17 GB |
 | QPS чтение | 8 680 peak (валидация на каждом API-запросе; Web-трафик идёт через sessions) |
-| QPS запись | ~100 (создание ключа, update last_used_at батчами) |
+| QPS запись | ~100 (только создание ключа) |
 | Консистентность | Strong |
 | Распределение ключей | Равномерное по key_hash |
 
@@ -869,19 +948,16 @@ erDiagram
 
 | Поле | Тип | Размер | Описание |
 | --- | --- | --- | --- |
-| session_id | UUID | 16 B | Первичный ключ |
-| user_id | UUID | 16 B | FK → users |
-| token_hash | VARCHAR | 64 B | Hash токена |
-| ip_address | VARCHAR | 45 B | IPv4/IPv6 |
-| user_agent | VARCHAR | 200 B | User-Agent |
+| token_hash | VARCHAR | 64 B | PK (ключ Redis `sess:{token_hash}`); SHA-256 от bearer-токена |
+| user_id | UUID | 16 B | FK → users (только это и нужно auth-middleware-у) |
 | created_at | TIMESTAMP | 8 B | Создание |
-| expires_at | TIMESTAMP | 8 B | Истечение |
+| expires_at | TIMESTAMP | 8 B | Истечение (24h TTL) |
 
 | Метрика | Значение |
 | --- | --- |
 | Строк | ~1 млрд (MAU — TTL = 30 сут покрывает весь месячный охват) |
-| Размер строки | ~360 B |
-| Общий объём | ~360 GB |
+| Размер строки | ~96 B |
+| Общий объём | ~96 GB (резидентно в RAM Redis, ×4 per-region) |
 | QPS чтение | 95 700 (проверка на каждый запрос) |
 | QPS запись | 4 200 (login) |
 | Консистентность | Strong |
@@ -891,52 +967,49 @@ erDiagram
 
 ### billing_accounts
 
-Hot-path таблица для резервирования и списания средств под inference-запросы (только API). Web-tier ограничения не затрагивают эту таблицу — они закрываются Rate Limiter-ом.
+Hot-path таблица для резервирования и списания средств под inference-запросы (только API). Все суммы в USD; мультивалютность намеренно не поддерживается в MVP.
 
 | Поле | Тип | Размер | Описание |
 | --- | --- | --- | --- |
-| user_id | UUID | 16 B | PK |
-| tier | ENUM | 1 B | free / plus / pro / max / api |
-| balance | DECIMAL(12,4) | 8 B | Доступные средства |
+| user_id | UUID | 16 B | PK; FK → users |
+| balance | DECIMAL(12,4) | 8 B | Доступные средства (USD) |
 | reserved | DECIMAL(12,4) | 8 B | Зарезервировано под in-flight запросы |
-| currency | VARCHAR | 3 B | USD |
 | updated_at | TIMESTAMP | 8 B | Последняя операция |
 
 | Метрика | Значение |
 | --- | --- |
-| Строк | ~100 млн (только API-пользователи) |
-| Размер строки | ~80 B |
-| Общий объём | ~8 GB |
-| QPS чтение | 17 360 (2 операции на API-запрос: reserve + finalize) |
+| Строк | ~100 млн |
+| Размер строки | ~64 B |
+| Общий объём | ~6.4 GB |
+| QPS чтение | 17 360 |
 | QPS запись | 17 360 |
-| Консистентность | **Strong (SERIALIZABLE)** — нельзя списать одни деньги дважды |
-| Распределение ключей | Hot keys у самых активных API-клиентов |
+| Консистентность | Strong (SERIALIZABLE) |
 
 ---
 
 ### usage_records
 
-Append-only лог завершённых inference-запросов **по обоим каналам** (Web + API): нужен для биллинг-дашбордов (API), anti-abuse-расследований и квот free/plus tier (Web). Одна строка на завершённый цикл.
+Append-only лог завершённых inference-запросов **по обоим каналам** (Web + API): нужен для биллинг-дашбордов (API), маржинальности per канал, anti-abuse-расследований и квот free/plus tier (Web). Одна строка на завершённый цикл.
 
 | Поле | Тип | Размер | Описание |
 | --- | --- | --- | --- |
 | record_id | UUID | 16 B | Первичный ключ |
 | user_id | UUID | 16 B | FK → users |
 | conv_id | UUID | 16 B | FK → conversations (NULL для API) |
-| message_id | UUID | 16 B | FK → messages (NULL для API) |
-| channel | ENUM | 1 B | web / api |
-| model | VARCHAR | 20 B | Модель |
+| message_id | UUID | 16 B | FK → messages (assistant; NULL для API) |
+| request_id | UUID | 16 B | Correlation ID цикла (= `messages.request_id`); общий хвост с trace в Tempo |
+| channel | ENUM | 1 B | `web` / `api`. **Источник вызова**, не derived из tier: plus-юзер может вызывать через personal API. Нужен для (1) маржинальности per канал, (2) quota policies, (3) abuse-детекции, (4) disputes |
+| model_id | UUID | 16 B | FK → `models.model_id` (конкретная ценовая версия — цены не «разъезжаются» при изменении прайс-листа) |
 | prompt_tokens | INT | 4 B | Токены промпта |
 | completion_tokens | INT | 4 B | Токены ответа |
-| total_tokens | INT | 4 B | Сумма |
-| cost | DECIMAL | 8 B | Стоимость (для Web — расчётная, для биллинг-аналитики) |
+| cost | DECIMAL | 8 B | **Для API:** реальная сумма, списанная с `balance` (= `prompt_tokens × price_input_per_1k / 1000 + completion_tokens × price_output_per_1k / 1000`). **Для Web:** расчётная цена по тому же прайс-листу — клиент платит фиксированную подписку, но cost нужен для FinOps (unit-economics, маржа на одного юзера) |
 | created_at | TIMESTAMP | 8 B | Время |
 
 | Метрика | Значение |
 | --- | --- |
 | Строк | ~5.875 млрд/день, ~2.14 трлн/год (Web 28 935 + API 39 063 циклов/сек × 86 400) |
-| Размер строки | ~120 B |
-| Общий объём | ~700 ГБ/день, ~250 ТБ/год |
+| Размер строки | ~116 B (после удаления `total_tokens`) |
+| Общий объём | ~680 ГБ/день, ~243 ТБ/год |
 | QPS чтение | ~1 000 (billing dashboard, anti-abuse-инвестигейшн) |
 | QPS запись | 67 998 avg / 135 996 peak (= Total inference RPS из §2.2) |
 | Консистентность | Eventual (async insert батчем — допустима задержка до 1 секунды) |
@@ -946,39 +1019,38 @@ Append-only лог завершённых inference-запросов **по об
 
 ### attachments
 
-Метаданные вложений (фото и документы). Сами бинарные данные хранятся в S3 (см. §6.1) — в таблице только ссылка (`s3_bucket`, `s3_key`), size, mime и статус (`uploading` / `ready` / `deleted`). Бинарники в S3 — ~97% физического объёма данных сервиса (~126 ПБ/год, §2.3), поэтому исключать вложения из логической схемы нельзя.
+Метаданные вложений (фото и документы). Сами бинарные данные хранятся в Ceph RGW (см. §6.1) — в таблице только ссылка (`s3_bucket`, `s3_key` — поля сохраняют S3-API-нейминг, потому что Ceph RGW S3-compatible), mime и статус (`uploading` / `ready` / `deleted`). Бинарники — ~97% физического объёма данных сервиса (~126 ПБ/год, §2.3), поэтому исключать вложения из логической схемы нельзя.
 
-Upload flow (direct-to-S3, не через ingress-nginx): клиент запрашивает presigned PUT у Chat Service → получает URL + `attachment_id` в статусе `uploading` → заливает файл напрямую в S3 → S3 event notification меняет статус на `ready`. Подробности — `notes/section-7-10-drafts.md` (multimodal flow).
+Upload flow (direct-to-RGW, не через ingress-nginx): клиент запрашивает presigned PUT у Chat Service → получает URL + `attachment_id` в статусе `uploading` → заливает файл напрямую в региональный Ceph RGW → bucket-notification от RGW меняет статус на `ready`.
 
 | Поле | Тип | Размер | Описание |
 | --- | --- | --- | --- |
 | attachment_id | UUID | 16 B | Первичный ключ |
-| message_id | UUID | 16 B | FK → messages (к какому сообщению) |
-| user_id | UUID | 16 B | FK → users (для прав доступа и биллинга объёма) |
-| s3_bucket | VARCHAR | ~30 B | Имя bucket (регионально) |
+| message_id | UUID | 16 B | FK → messages (user-сообщение, к которому прикреплено вложение) |
+| user_id | UUID | 16 B | FK → users (для прав доступа) |
+| request_id | UUID | 16 B | Correlation ID цикла (= `messages.request_id` user-сообщения) |
+| s3_bucket | VARCHAR | ~30 B | Имя bucket в RGW (регионально) |
 | s3_key | VARCHAR | ~80 B | Путь внутри bucket, `{user_id}/{attachment_id}` |
-| mime_type | VARCHAR | ~30 B | `image/png`, `application/pdf`, … |
-| size_bytes | BIGINT | 8 B | Размер файла (после client-side compression, ~2 МБ avg) |
-| sha256 | VARCHAR | 64 B | Хэш для дедупликации и целостности |
-| status | ENUM | 1 B | uploading / ready / deleted |
+| mime_type | VARCHAR | ~30 B | `image/png`, `application/pdf`, … — нужен для UI (иконка) и для роутинга vision/non-vision (image → vision encoder) без extra `HeadObject` |
+| status | ENUM | 1 B | `uploading` / `ready` / `deleted`. Конечный автомат жизненного цикла upload: presigned URL выдан → bucket notification → soft-delete |
 | created_at | TIMESTAMP | 8 B | Создание записи |
 
 | Метрика | Значение |
 | --- | --- |
 | Строк | ~64 млрд/год (2.5 млрд Web-сообщений/день × 7% с вложением [^6] = 175 млн/день) |
 | Средний размер файла | 2 МБ (после client-side compression до 1024×1024, см. §2.2) |
-| Средний размер строки в БД | ~280 B (только метаданные) |
-| Объём метаданных | ~18 ТБ/год |
-| Объём бинарных данных в S3 | ~126 ПБ/год (см. §2.3) |
-| QPS запись (create) | 4 050 peak (7% от Web inference peak 57 870); +такая же RPS на async status update от S3 event notification |
+| Средний размер строки в БД | ~210 B (только метаданные) |
+| Объём метаданных | ~13 ТБ/год |
+| Объём бинарных данных в Ceph RGW | ~126 ПБ/год (см. §2.3) |
+| QPS запись (create) | 4 050 peak (7% от Web inference peak 57 870); +такая же RPS на async status update от bucket notification |
 | QPS чтение | ~3 750 peak (открытие диалога с вложением ≈ 15% от 25 000 peak open-dialog) |
-| Пик трафика на S3 | 64.81 Гбит/с incoming (см. §2.3); исходящий — через внешний CDN (cdn.llm.com) |
-| Консистентность | Strong для метаданных; S3 eventual для object listing, read-your-write для GET по ключу |
+| Пик трафика на Ceph RGW | 64.81 Гбит/с incoming (см. §2.3); исходящий — через внешний CDN (cdn.llm.com) |
+| Консистентность | Strong для метаданных; в RGW — read-your-write для GET по ключу, eventual для object listing |
 | Распределение ключей | Hash по attachment_id, равномерное; hot-partitions не ожидаются (каждое вложение читается 1–3 раза) |
 
 ### audit_log
 
-Append-only лог значимых действий пользователя (логин, смена пароля, создание API-ключа, billing-операции). Нужен для compliance, security-расследований и anti-fraud. Хранится 1 год в PostgreSQL (партиционирование по дате), старше — в S3.
+Append-only лог значимых действий пользователя (логин, смена пароля, создание API-ключа, billing-операции). Нужен для compliance, security-расследований и anti-fraud. Хранится 1 год в PostgreSQL (партиционирование по дате), старше — на cold-tier Ceph RGW.
 
 | Поле | Тип | Размер | Описание |
 | --- | --- | --- | --- |
@@ -1000,27 +1072,24 @@ Append-only лог значимых действий пользователя (�
 
 ### rate_limits
 
-Redis-ключи `rl:{user_id}` — счётчики **sliding-window** (скользящее окно по времени) с алгоритмом **token bucket** (виртуальное «ведро» с N токенами, регенерируется по rate; запрос забирает 1 токен, при пустом ведре — 429). Проверяются Rate Limiter-ом на **каждом** HTTP-запросе, до Auth и до Billing. Живут локально в регионе (Rate Limiter — per-region, см. §3.3 и `notes/section-7-10-drafts.md`), без межрегиональной синхронизации.
+Per-user счётчики rate-limit-а — скользящее окно с алгоритмом token bucket. Проверяются на каждом HTTP-запросе, до Auth и до Billing. Сами лимиты (`rps_limit` / `tpm_limit`) лежат в `subscription_tiers` и здесь не дублируются.
 
-| Поле (внутри Hash) | Тип | Размер | Описание |
+| Поле | Тип | Размер | Описание |
 | --- | --- | --- | --- |
-| user_id | UUID | 16 B | Ключ Hash (`rl:{user_id}`) |
+| user_id | UUID | 16 B | PK |
 | window_start | TIMESTAMP | 8 B | Начало текущего окна |
 | request_count | INT | 4 B | Запросов в окне |
 | token_count | INT | 4 B | Выданных токенов в окне |
-| tier_limit_rps | INT | 4 B | Лимит RPS (из tier) |
-| tier_limit_tpm | INT | 4 B | Лимит TPM (из tier) |
 
 | Метрика | Значение |
 | --- | --- |
 | Строк | ~360 млн (DAU в пик) |
-| Размер строки | ~40 B |
-| Общий объём | ~15 GB (резидентно в RAM Redis) |
-| QPS чтение | 173 200 peak (каждый HTTP-запрос) |
-| QPS запись | 173 200 peak (атомарный инкремент через Lua) |
-| Консистентность | Strong **внутри региона**, eventual cross-region |
-| TTL | 60 сек на ключ (скользящее окно) |
-| Распределение ключей | Hot keys у активных пользователей |
+| Размер строки | ~32 B |
+| Общий объём | ~12 GB |
+| QPS чтение | 173 200 peak |
+| QPS запись | 173 200 peak |
+| Консистентность | Strong внутри региона, eventual cross-region |
+| TTL | 60 сек (скользящее окно) |
 
 ---
 
@@ -1030,9 +1099,9 @@ Redis-ключи `rl:{user_id}` — счётчики **sliding-window** (ско�
 
 | Сущность | Где живёт | Размер / QPS | Зачем не в БД |
 | --- | --- | --- | --- |
-| Назначение request → GPU worker | Inference Scheduler (in-memory + Raft-журнал для HA) | ~1–2 млн активных; 28 940 RPS на запись + 28 940 RPS на delete | Время жизни 5–60 сек, переживать рестарт не требуется — клиент всегда ретраит |
-| Контекст промпта | Regional Inference Service (heap) | ~20 ГБ на регион при пике | Отдаётся на GPU и сразу освобождается |
-| Поток токенов | gRPC stream (TCP-буфер + HTTP/2 окно) | ~2.3M tok/s в пике | HTTP/2 flow control даёт нативный backpressure; любой буфер был бы дополнительной точкой отказа |
+| Назначение request → GPU worker | В памяти inference-планировщика | ~1–2 млн активных, 28 940 RPS на создание + удаление | Время жизни 5–60 сек; при сбое клиент ретраит |
+| Контекст промпта | В памяти inference-сервиса | ~20 ГБ на регион в пике | Отдаётся на GPU и сразу освобождается |
+| Поток токенов | В открытом сетевом соединении до закрытия SSE | ~2.3M tok/s в пике | Любой буфер был бы дополнительной точкой отказа |
 
 Итоговый ответ модели (после закрытия SSE) записывается в `messages` как обычная строка — это и есть единственный след inference-запроса в долговременном хранилище.
 
@@ -1040,21 +1109,21 @@ Redis-ключи `rl:{user_id}` — счётчики **sliding-window** (ско�
 
 ## 5.4 Распределение нагрузки по ключам
 
-| Таблица | Ключ доступа | Характер распределения | Hot keys |
-| --- | --- | --- | --- |
-| users | `user_id`, `email` | Равномерное | Активные пользователи, но без концентрации |
-| conversations | `(user_id, updated_at)` | Pareto: top 1% активных дают ~25% запросов; top 10% — ~60% | Power-users с тысячами диалогов |
-| messages | `conv_id` | Hot-partitions у активных диалогов; внутри партиции — равномерное по `created_at` | Диалоги в активной фазе генерации |
-| api_keys | `key_hash` | Равномерное (хэш) | — |
-| sessions | `token_hash` | Равномерное (хэш) | — |
-| billing_accounts | `user_id` | Hot keys у самых активных API-клиентов (B2B-боты) | Топ-100 коммерческих ключей дают >50% всех reserve/finalize |
-| rate_limits | `user_id` | Hot keys у активных пользователей | Те же топ-1% что и в conversations |
-| usage_records | `user_id` | Hot keys у активных пользователей; партиционирование по `toYYYYMM(created_at)` сглаживает | — |
-| attachments (метаданные) | `attachment_id` | Равномерное (хэш) | — |
-| attachments (blob, S3) | `s3_key` | Равномерное; каждый файл читается 1–3 раза | — |
-| audit_log | партиции по дате + `user_id` внутри | Равномерное по дате; внутри партиции — равномерно | — |
-
-Главные hot-partitions — `messages` и `conversations` для топ-1% самых активных пользователей. Закрываем тремя способами: (1) в Scylla `messages` крупная партиция (тысячи сообщений) всё равно лежит на одной ноде, но кэшируется в memtable; (2) в PG `conversations` шардируем по `hash(user_id)` — нагрузка размазывается; (3) `rate_limits` per-region режет cross-region координацию (см. §6.6).
+| Таблица | Ключ | Характер распределения |
+| --- | --- | --- |
+| subscription_tiers | tier_id | Равномерное |
+| models | model_id | Равномерное |
+| users | user_id, email | Равномерное |
+| conversations | user_id | Перевес в пользу активных пользователей |
+| messages | conv_id | Перевес в пользу активных диалогов |
+| api_keys | key_hash | Равномерное |
+| sessions | token_hash | Равномерное |
+| billing_accounts | user_id | Перевес в пользу активных API-клиентов |
+| rate_limits | user_id | Перевес в пользу активных пользователей |
+| usage_records | user_id | Перевес в пользу активных пользователей |
+| attachments (метаданные) | attachment_id | Равномерное |
+| attachments (blob) | s3_key | Равномерное |
+| audit_log | created_at, user_id | Равномерное |
 
 ---
 
@@ -1062,61 +1131,73 @@ Redis-ключи `rl:{user_id}` — счётчики **sliding-window** (ско�
 
 | Таблица | Строк | Размер строки | Объём | QPS Read | QPS Write | Консистентность |
 | --- | --- | --- | --- | --- | --- | --- |
+| subscription_tiers | ~50 | 100 B | < 5 КБ | ~10 (миссы кеша) | < 0.1 | Strong |
+| models | ~100 | 130 B | ~13 КБ | ~10 (миссы кеша) | < 0.1 | Strong |
 | users | 1 млрд | 200 B | 200 GB | 4 200 | 100 | Strong |
-| conversations | 50 млрд | 170 B | 8.5 TB | 33 500 / 67k peak | 28 935 / 57 870 peak | Strong (user) |
-| messages | 1.83 трлн/год | 2.5 KB | 4.5 PB/год | 12 500 / 25k peak | 57 870 / 115 740 peak | Eventual |
-| api_keys | 100 млн | 180 B | 18 GB | 8 680 (peak) | 100 | Strong |
-| sessions | 1 млрд | 360 B | 360 GB | 95 700 | 4 200 | Strong |
-| rate_limits | 360 млн | 40 B | 15 GB | 173 200 | 173 200 | Strong (per-region) |
-| billing_accounts | 100 млн | 80 B | 8 GB | 17 360 | 17 360 | Strong (SERIALIZABLE) |
-| usage_records | 2.14 трлн/год | 120 B | ~250 TB/год | 1 000 | 67 998 / 135 996 peak | Eventual |
-| attachments (метаданные) | 64 млрд/год | 280 B | 18 TB/год | 3 750 peak | 4 050 peak | Strong |
-| attachments (blob в S3) | — | 2 МБ | **~126 ПБ/год** | 64.81 Гбит/с (через CDN) | 64.81 Гбит/с direct | S3 read-your-write |
+| conversations | 50 млрд | 140 B | 7.0 TB | 33 500 / 67k peak | 28 935 / 57 870 peak | Strong (user) |
+| messages | 1.83 трлн/год | 2.5 KB | 4.57 PB/год | 12 500 / 25k peak | 57 870 / 115 740 peak | Eventual |
+| api_keys | 100 млн | 170 B | 17 GB | 8 680 (peak) | 100 | Strong |
+| sessions | 1 млрд | 96 B | 96 GB | 95 700 | 4 200 | Strong |
+| rate_limits | 360 млн | 32 B | 12 GB | 173 200 | 173 200 | Strong (per-region) |
+| billing_accounts | 100 млн | 64 B | 6.4 GB | 17 360 | 17 360 | Strong (SERIALIZABLE) |
+| usage_records | 2.14 трлн/год | 116 B | ~243 TB/год | 1 000 | 67 998 / 135 996 peak | Eventual |
+| attachments (метаданные) | 64 млрд/год | 210 B | 13 TB/год | 3 750 peak | 4 050 peak | Strong |
+| attachments (blob в Ceph RGW) | — | 2 МБ | **~126 ПБ/год** | 64.81 Гбит/с (через CDN) | 64.81 Гбит/с direct | Read-your-write |
 | audit_log | 10 млрд/год | 280 B | 3 TB/год | 50 | 2 000 peak | Strong (append-only) |
 
 ---
 
 # 6. Физическая схема БД
 
-## 6.1 Выбор СУБД
+## 6.1 Принципы выбора хранилищ
 
-Для каждой таблицы — короткое обоснование (требования) + альтернатива, которую отвергли.
+Один тип базы данных не покрывает все требования одинаково эффективно. В таблице ниже — назначение каждого контура и причина выбора технологии.
 
-| Таблица | СУБД | Требования | Альтернатива (отвергнута) |
-| --- | --- | --- | --- |
-| users / conversations / api_keys / attachments_metadata / billing_accounts / audit_log | **PostgreSQL** | Реляционные данные, JOIN, strong consistency, ACID-транзакции (особенно billing). Объём <10 ТБ на таблицу | MySQL — сопоставим, но у PG лучше партиционирование и JSONB; ScyllaDB не подходит т.к. нет транзакций и JOIN |
-| messages | **ScyllaDB** | Write-heavy 58k RPS avg, объём 4.5 ПБ/год, типичный запрос `WHERE conv_id=?`. Не нужны JOIN, eventual consistency допустима | PostgreSQL/Citus — упрётся в дисковый I/O при 4.5 ПБ; Cassandra — более медленная (Java GC) при той же модели данных, Scylla даёт ×3 throughput на той же железке |
-| sessions | **Redis** | 95 700 RPS чтение на каждый HTTP-запрос, TTL 24h, простой key-value. Latency <1 мс критичен для auth | PostgreSQL — выдержит RPS, но добавит ~5 мс к каждому запросу; в-памяти таблицы PG не дают TTL |
-| rate_limits | **Redis** | 173 200 RPS на каждый запрос, атомарный check-and-incr через Lua, sliding window TTL 60с | Локальный counter в API pod — не работает при балансировке (один user попадает на разные pods); PostgreSQL — слишком медленно |
-| usage_records | **ClickHouse** | Append-only, ~250 ТБ/год, write-heavy 68k RPS avg, аналитические агрегации (SUM tokens/cost по user/period), сжатие LZ4 ×10 | PostgreSQL — нет столбцового сжатия, агрегации по 250 ТБ = минуты; Druid — сложнее эксплуатировать при таком же выигрыше |
-| attachments (blob) | **S3 (object storage)** | 126 ПБ/год, cheap cold-storage, прямой PUT/GET клиента минует наш ingress (нет 64.81 Гбит/с через nginx) | Самописный blob-store на дисках — managed S3 даёт **99.999999999%** (11 девяток) durability, cross-region replication, lifecycle policies из коробки |
+| Контур | Хранилище | Почему выбран именно этот вариант |
+| --- | --- | --- |
+| Пользовательские данные (users, conversations, api_keys, attachments_metadata) | PostgreSQL + Citus | PostgreSQL даёт ACID, SQL и зрелую экосистему. Citus добавляет горизонтальное шардирование по distribution column (`user_id`) и co-location связанных таблиц на одном worker-узле — `GET /v1/profile` обслуживается без cross-shard JOIN. |
+| Биллинг (billing_accounts) | PostgreSQL (отдельный кластер) | Резерв и списание средств требуют SERIALIZABLE-транзакций. Централизованный кластер в US East снимает distributed coordination и риск списать одни деньги дважды. |
+| Справочники (subscription_tiers, models) | PostgreSQL reference tables | Маленькие версионируемые таблицы с бизнес-атрибутами (цены, лимиты). Logical replication раздаёт read-only-копию на каждый PG-шард — `JOIN users → subscription_tiers` обслуживается локально. |
+| Журнал событий (audit_log) | PostgreSQL | Append-only с партициями по дате; нужны индексы `(user_id, created_at)` для security-расследований. Объём <10 ТБ — PG справляется без OLAP-движка. |
+| Чат-сообщения (messages) | ScyllaDB | Write-heavy 58k RPS на PB-объём. Wide-column модель идеально ложится на партицию `conv_id` — все сообщения диалога на одной ноде; eventual consistency допустима. |
+| Сессии и rate-limit | Redis Cluster | Низкая задержка на каждом HTTP-запросе (auth ~95k RPS, rate-limit ~173k RPS), TTL из коробки, атомарные Lua-операции для check-and-incr. Распределение по 16 384 hash slots даёт линейное горизонтальное масштабирование. |
+| Биллинг-аналитика (usage_records) | ClickHouse | Append-only ~243 ТБ/год, аналитические агрегации по большим объёмам. MergeTree с партиционированием по `toYYYYMM` и `LowCardinality(String)` для `channel` даёт ×10 сжатие LZ4 и sub-second агрегации. |
+| Объектное хранилище (attachments blob) | Ceph Object Gateway (RGW) | S3-совместимый API поверх собственного Ceph-кластера, масштабируется добавлением OSD-узлов, поддерживает multisite-репликацию. На 126 ПБ/год self-hosted решение согласовано с on-prem архитектурой (свои ДЦ, GPU, BGP) и кратно дешевле managed AWS S3 по storage и egress. |
 
-Использовано 5 разных движков, потому что паттерны нагрузки несовместимы: реляц-OLTP с ACID (PG), in-memory key-value под <1 мс latency (Redis), **wide-column** (схема: row + dynamic columns с partition+clustering ключами) write-heavy 58k RPS на PB-объём (Scylla), OLAP-колоночник для аналитических агрегаций (ClickHouse) и object storage на PB (S3). Развёрнутое сравнение паттернов — `notes/defense-cheatsheet.md`.
+MinIO как основное blob-хранилище не выбран: репозиторий `minio/minio` в начале 2026 года переведён в read-only — это операционный риск. Garage — лёгкая альтернатива для small/medium; для десятков ПБ выбран Ceph RGW как индустриальный стандарт с зрелой multisite-репликацией.
 
-Kafka в архитектуре **не используется** — для нашей нагрузки с одним consumer (ClickHouse) и транзакционным billing хватает прямых связей:
+Kafka в архитектуре не используется: единственный consumer аналитики — ClickHouse, который сам батчит входящие записи через async insert; биллинг синхронный и идёт напрямую в PG. Появятся независимые consumer-ы — Kafka добавится как fanout, сейчас это over-engineering.
 
-* `usage_records` пишутся напрямую в ClickHouse через **async insert** (встроенное серверное батчирование, 68k RPS avg / 136k peak переваривается без внешнего буфера)
-* `billing_accounts` обновляются синхронно в PostgreSQL (нужна strong consistency для резервирования денег)
-* audit-события — append-only таблица в PostgreSQL + периодическая выгрузка в S3
+ENUM vs справочник — решается по правилу «есть ли у значения бизнес-атрибуты»:
 
-Если в будущем появятся независимые consumer-ы (anti-fraud, внешний DWH, нотификации) — Kafka добавится как fanout между Chat Service и ними. Сейчас это over-engineering.
-
-Очереди `inference_queue` и буфера `streaming_buffer` в БД тоже нет (см. 5.2): они заменены прямой server-streaming gRPC-связностью Regional Inference ↔ GPU Worker.
+| Поле | Решение | Почему |
+| --- | --- | --- |
+| `users.tier_id`, `messages.model_id`, `usage_records.model_id` | Справочник (PG) | Есть атрибуты (цены, лимиты, max_context); версионируем при изменениях |
+| `messages.role`, `attachments.status`, `usage_records.channel`, `messages.finish_reason`, `audit_log.event_type` | ENUM / VARCHAR / `LowCardinality` | Нет бизнес-атрибутов; в Scylla JOIN недоступен, в CH `LowCardinality` — это уже «словарь под капотом» |
 
 ---
 
-## 6.2 Физические проекции данных
+## 6.2 Физическое распределение таблиц
 
-Прежде чем шардировать, нужно понять **какие данные обязаны лежать рядом** под конкретные сценарии. Это даёт две физические проекции:
+| Таблица / данные | Хранилище | Шардирование / партиционирование | Репликация | Регион |
+| --- | --- | --- | --- | --- |
+| `subscription_tiers` | PostgreSQL reference table | не шардится; полная копия на каждом worker | logical replication во все шарды | master US East → все ДЦ |
+| `models` | PostgreSQL reference table | не шардится; полная копия на каждом worker | logical replication во все шарды | master US East → все ДЦ |
+| `users` | PostgreSQL + Citus | `hash(user_id) % 64` | 1 primary + 1 sync + 1 async replica | US East + US West |
+| `conversations` | PostgreSQL + Citus | `hash(user_id)` (colocated с `users`) | colocated с `users` | US East + US West |
+| `api_keys` | PostgreSQL + Citus | `hash(user_id)` (colocated с `users`) | colocated с `users` | US East + US West |
+| `attachments` (метаданные) | PostgreSQL + Citus | `hash(user_id)` (colocated с `users`) | colocated с `users` | US East + US West |
+| `billing_accounts` | PostgreSQL (отдельный кластер) | `hash(user_id) % 32` | 1 primary + 1 sync replica (same AZ) + 1 async replica (US West) | US East only |
+| `audit_log` | PostgreSQL | `PARTITION BY toYYYYMMDD(created_at)` + `hash(user_id) % 16` | 1 primary + 1 async replica | US East only |
+| `messages` | ScyllaDB | partition `conv_id` (Murmur3), clustering `(created_at DESC, message_id)` | multi-DC: RF=3 в US, RF=1 в EU, RF=1 в APAC; total RF=5 | все 4 ДЦ |
+| `usage_records` | ClickHouse | `hash(user_id) % 8`, `PARTITION BY toYYYYMM(created_at)` | ReplicatedMergeTree, 2 реплики на shard | US East only |
+| `sessions` | Redis Cluster | 16 384 hash slots по `sess:{token_hash}` | 1 master + 1 replica на slot | per-region (×4) |
+| `rate_limits` | Redis Cluster | 16 384 hash slots по `rl:{user_id}` | 1 master + 1 replica на slot | per-region (×4) |
+| `attachments` (blob) | Ceph RGW | bucket per region; CRUSH-распределение по OSD | Erasure Coding 8+3 + multisite-репликация | US East+West (origin), EU/APAC (replicas) |
 
-| Проекция | Ключ доступа | Какие сценарии обслуживает | Что лежит рядом |
-| --- | --- | --- | --- |
-| **conversation-centric** | `conv_id` | `POST /v1/chat/completions` (запись prompt + assistant), `GET /v1/conversations/{id}/messages` (история) | Все сообщения одного диалога — на одной партиции ScyllaDB; чтение истории = одно partition-сканирование без **scatter-gather** (распределённого fan-out по всем шардам с последующей сборкой ответа — антипаттерн для OLTP) |
-| **user-centric** | `user_id` | `GET /v1/conversations` (список чатов), `GET /v1/profile`, auth, billing reserve, rate-limit check, выгрузка по квоте на attachments | Все объекты пользователя (`conversations`, `api_keys`, `attachments_metadata`, `billing_accounts`, `audit_log`) — на одном PG-шарде; список чатов читается одним запросом |
+GPU-кластеры — только в US (см. §3.2), durable state синхронизирован с этим: PostgreSQL и ClickHouse централизованы в US, ScyllaDB размазан по всем регионам, Redis — per-region (locality для auth/rate-limit на каждом HTTP-запросе).
 
-Это и определяет **разные shard key для разных таблиц**: `messages` — по `conv_id` (Scylla), всё остальное — по `user_id` (PG/Citus, Redis CRC16, ClickHouse). Никакого общего «глобального» шарда нет.
-
-Кросс-проекционный шов проходит через `messages.conv_id ↔ conversations.conv_id` и пересекается только при первом GET на список диалогов: PG возвращает `conv_id[]` → клиент тянет `messages` из Scylla отдельным запросом. Этого достаточно — JOIN между PG и Scylla не нужен.
+Используемые сокращения: **RF** (Replication Factor) — число копий каждой строки в кластере; **AZ** (Availability Zone) — изолированная группа стоек внутри ДЦ; **RPO** (Recovery Point Objective) — макс. потеря данных по времени; **RTO** (Recovery Time Objective) — макс. время восстановления.
 
 ---
 
@@ -1126,103 +1207,100 @@ Kafka в архитектуре **не используется** — для н�
 
 ```mermaid
 erDiagram
+    subscription_tiers {
+        UUID tier_id PK "global, logical replication"
+        VARCHAR tier_code
+        VARCHAR display_name
+        DECIMAL price_monthly
+        INT rps_limit
+        INT tpm_limit
+        INT context_limit
+        TIMESTAMP effective_from
+        TIMESTAMP effective_to
+    }
+    models {
+        UUID model_id PK "global, logical replication"
+        VARCHAR model_code
+        DECIMAL price_input_per_1k
+        DECIMAL price_output_per_1k
+        INT max_context
+        BOOLEAN supports_vision
+        TIMESTAMP effective_from
+        TIMESTAMP effective_to
+    }
     users {
         UUID user_id PK "shard: hash(user_id) % 64"
         VARCHAR email UK "IDX: B-tree UNIQUE"
         VARCHAR password_hash
         VARCHAR display_name
-        ENUM tier
-        TIMESTAMP created_at
-        TIMESTAMP updated_at
+        UUID tier_id FK
     }
-
     conversations {
         UUID conv_id PK
-        UUID user_id FK "shard: hash(user_id) % 64"
+        UUID user_id FK "shard: hash(user_id)"
         VARCHAR title
-        VARCHAR model
         BOOLEAN is_archived
-        TIMESTAMP created_at "IDX: (user_id, updated_at DESC)"
-        TIMESTAMP updated_at "IDX: (user_id, is_archived)"
+        TIMESTAMP updated_at "IDX: (user_id, updated_at DESC)"
     }
-
     api_keys {
         UUID key_id PK
-        UUID user_id FK "shard: hash(user_id) % 64"
+        UUID user_id FK "shard: hash(user_id)"
         VARCHAR key_hash "IDX: B-tree"
-        VARCHAR key_prefix
-        VARCHAR name
-        BOOLEAN is_active
-        TIMESTAMP created_at
-        TIMESTAMP last_used_at
     }
-
+    attachments {
+        UUID attachment_id PK
+        UUID message_id FK
+        UUID user_id FK "shard: hash(user_id)"
+        UUID request_id "IDX: (request_id)"
+    }
     billing_accounts {
-        UUID user_id PK "shard: hash(user_id) % 64 (centralized US)"
-        ENUM tier "IDX: (tier, balance) partial WHERE balance < threshold"
-        DECIMAL balance
+        UUID user_id PK "shard: hash(user_id) % 32, US East only"
+        DECIMAL balance "IDX: (balance) partial"
         DECIMAL reserved
-        VARCHAR currency
-        TIMESTAMP updated_at
     }
-
+    subscription_tiers ||--o{ users : ""
     users ||--o{ conversations : ""
     users ||--o{ api_keys : ""
+    users ||--o{ attachments : ""
     users ||--|| billing_accounts : ""
 ```
-
-**billing_accounts** — отдельный PostgreSQL-кластер в US East (не смешивается с региональными шардами users/conversations/api_keys). SELECT ... FOR UPDATE блокирует строку до конца транзакции резервирования.
 
 ### ScyllaDB
 
 ```mermaid
 erDiagram
     messages {
-        UUID conv_id PK "Partition Key"
+        UUID conv_id PK "Partition Key (Murmur3)"
         TIMESTAMP created_at "Clustering Key DESC"
         UUID message_id "Clustering Key (tiebreaker)"
+        UUID parent_message_id
+        UUID request_id
         TEXT role
+        UUID model_id "NULL для role=user"
         TEXT content
         INT tokens_count
-        TEXT finish_reason
     }
+    messages_by_request {
+        UUID request_id PK "MV Partition Key"
+        UUID conv_id
+        UUID message_id
+        TIMESTAMP created_at
+    }
+    messages ||--o{ messages_by_request : "materialized view"
 ```
 
-В ScyllaDB primary key состоит из двух частей:
-
-| Часть ключа | Поле(я) | Что определяет |
-| --- | --- | --- |
-| **Partition Key** | `conv_id` | На какой ноде кластера физически лежит партиция (через Murmur3-хэш). Все сообщения одного диалога — **на одной ноде**, читаются одним запросом без cross-node coordinator |
-| **Clustering Key** | `created_at DESC, message_id` | Порядок строк **внутри** партиции на диске (sorted by SSTable). `DESC` оптимизирует «последние N сообщений» — самые свежие читаются с начала файла; `message_id` — tiebreaker на случай совпадения timestamp при одновременных вставках |
-
-Типовые запросы и стоимость:
-
-Запись в Scylla идёт через **memtable** (in-memory write buffer) + **WAL** (Write-Ahead Log на диск, для durability при падении ноды). Когда memtable заполняется, он флашится в **SSTable** (Sorted-String-Table — sorted-by-key file на диске, immutable; периодически compactится фоном). Чтение объединяет данные из memtable и всех актуальных SSTable.
-
-Типовые запросы и стоимость:
-
-| Запрос | Cost |
-| --- | --- |
-| `SELECT * FROM messages WHERE conv_id=? LIMIT 50` | 1 partition read, 50 rows последовательно с диска (≈ 1 SSTable seek) |
-| `SELECT * FROM messages WHERE conv_id=? AND created_at > ?` | Range scan внутри партиции, ограничено clustering key |
-| `INSERT INTO messages (...)` | Append к memtable + WAL; flush на диск батчем |
-| `SELECT * FROM messages WHERE message_id=?` | **Антипаттерн**: full scan по всем партициям (без partition key); запрещён в API |
-
 ### ClickHouse
-
-Движок таблицы — `MergeTree` (семейство движков ClickHouse: данные сортируются по `ORDER BY` и периодически мёржатся в фоне для оптимизации чтения). Колонка `model` — `LowCardinality` (словарное сжатие для столбцов с небольшим набором уникальных значений: имена моделей повторяются на миллиарды строк, словарь даёт ×10–×50 экономии).
 
 ```mermaid
 erDiagram
     usage_records {
         UUID record_id
         UUID user_id "ORDER BY (user_id, created_at)"
-        UUID conv_id
-        UUID message_id
-        String model "LowCardinality"
+        UUID request_id "IDX: bloom_filter"
+        UUID model_id
+        String channel "LowCardinality"
         UInt32 prompt_tokens
         UInt32 completion_tokens
-        UInt32 total_tokens
         Decimal64 cost
         DateTime created_at "PARTITION BY toYYYYMM()"
     }
@@ -1233,188 +1311,257 @@ erDiagram
 ```mermaid
 graph LR
     subgraph Redis["Redis Cluster (per region)"]
-        S["sessions<br/>Key: sess:{token_hash}<br/>Value: JSON<br/>TTL: 24h"]
-        R["rate_limits<br/>Key: rl:{user_id}<br/>Type: Hash<br/>TTL: 60s<br/>Lua check_and_incr"]
+        S["sessions<br/>Key: sess:{token_hash}<br/>TTL: 24h"]
+        R["rate_limits<br/>Key: rl:{user_id}<br/>Hash, TTL: 60s"]
+        T["tier_cache<br/>Key: tier:{tier_id}<br/>Hash, TTL: 300s"]
+        M["model_cache<br/>Key: model:{model_id}<br/>Hash, TTL: 300s"]
     end
 ```
 
-Rate Limiter вызывает Lua-скрипт `check_and_incr(user_id, cost_tokens)` атомарно:
-1. `HMGET rl:{user_id} request_count token_count tier_limit_rps tier_limit_tpm`
-2. Проверяет оба лимита; если превышен — возвращает `DENY`
-3. `HINCRBY` обоих счётчиков + `EXPIRE 60` (скользящее окно)
-4. Возвращает `ALLOW`
+---
 
-Одним RTT получается атомарная проверка + инкремент под 173 200 RPS пика.
+## 6.4 Шардирование PostgreSQL/Citus
 
-### Поток usage-событий без Kafka
+Citus распределяет строки по worker-узлам через distribution column. Правильный выбор столбца ключевой: связанные данные оказываются на одних и тех же узлах, что снимает scatter-gather и ускоряет JOIN. Документация Citus рекомендует выбирать столбец с высокой кардинальностью и частым использованием в фильтрах/JOIN-ах, а маленькие справочники выносить в reference tables.
 
-```mermaid
-graph LR
-    Chat["Chat Service"] -->|"sync UPDATE:<br/>finalize reserve"| PG["PostgreSQL<br/>billing_accounts"]
-    Chat -->|"HTTP async insert<br/>(batched 1000 rows/sec)"| CH["ClickHouse<br/>usage_records"]
-    Chat -->|"append row"| Audit["PostgreSQL<br/>audit_log"]
-    Audit -.->|"daily dump"| S3["S3 (cold)"]
+### 6.4.1 Пользовательские данные
+
+Все пользовательские таблицы распределяются по `user_id` и co-located с `users`:
+
+```sql
+SELECT create_distributed_table('users',         'user_id');
+SELECT create_distributed_table('conversations', 'user_id', colocate_with => 'users');
+SELECT create_distributed_table('api_keys',      'user_id', colocate_with => 'users');
+SELECT create_distributed_table('attachments',   'user_id', colocate_with => 'users');
 ```
 
-После закрытия SSE Chat Service параллельно:
-* синхронно обновляет `billing_accounts` (финализация резерва, strong consistency);
-* батчем отправляет строку в ClickHouse (async insert — ClickHouse сам сольёт буферы);
-* пишет запись в `audit_log` (PostgreSQL append-only, партиционирование по дате).
+Обоснование:
+1. `GET /v1/profile`, `GET /v1/conversations`, проверка `api_key` — всегда в контексте одного пользователя;
+2. co-location позволяет JOIN-ить colocated-таблицы локально на одном worker;
+3. `user_id` (UUID) имеет высокую кардинальность — равномерное распределение.
 
----
+Риск «горячего пользователя» (один аккаунт с тысячами чатов и вложений) ограничен продуктовыми лимитами (макс. число чатов на user, постраничная выдача, soft-cap по числу api_keys). Для аномально активных B2B-аккаунтов возможен tenant-shard.
 
-## 6.4 Индексы
+### 6.4.2 Биллинг
 
-| Таблица | Индекс | Тип | Обоснование |
-| --- | --- | --- | --- |
-| users | PK: user_id | B-tree | Primary lookup |
-| users | UNIQUE: email | B-tree | Login |
-| conversations | PK: conv_id | B-tree | Primary lookup |
-| conversations | (user_id, updated_at DESC) | B-tree | Список чатов с сортировкой |
-| conversations | (user_id, is_archived) | B-tree | Фильтр активных/архивных |
-| api_keys | PK: key_id | B-tree | Primary lookup |
-| api_keys | key_hash | B-tree | Валидация API-ключа |
-| api_keys | user_id | B-tree | Список ключей пользователя |
-| billing_accounts | PK: user_id | B-tree | Hot lookup при reserve/finalize |
-| billing_accounts | (tier, balance) WHERE balance < threshold | Partial B-tree | Для проактивного уведомления о низком балансе |
-| messages | Partition: conv_id | Hash | Все сообщения чата на одном узле |
-| messages | Clustering: created_at DESC | Sorted | Порядок внутри диалога |
-| usage_records | ORDER BY (user_id, created_at) | MergeTree | Агрегации по пользователю |
-| usage_records | PARTITION BY toYYYYMM(created_at) | Partition | Очистка старых данных |
-| sessions | KEY sess:{token_hash} | Hash | O(1) lookup |
-| rate_limits | KEY rl:{user_id} | Hash | O(1) lookup |
-| attachments | PK: attachment_id | B-tree | Primary lookup |
-| attachments | (message_id) | B-tree | Список вложений сообщения |
-| attachments | (user_id, created_at DESC) | B-tree | Гистограмма/квоты пользователя, purge old |
-| audit_log | PK: (created_at_partition, event_id) | B-tree | Primary + partition pruning |
-| audit_log | (user_id, created_at DESC) per partition | B-tree | Security investigation по пользователю |
+`billing_accounts` живёт в **отдельном** PG-кластере, шардируется по `user_id % 32`, но не co-located с пользовательским кластером.
 
----
+Причины:
+- `reserve` / `finalize` требуют SERIALIZABLE-транзакций без distributed coordination — централизованный кластер в US East снимает риск списать одни деньги дважды.
+- Failure domain не пересекается с пользовательскими данными: падение billing-кластера не валит весь API-канал.
+- Объём (~7 ГБ) намного меньше пользовательского — 32 шардов достаточно.
 
-## 6.5 Денормализация
+### 6.4.3 Справочники
 
-| Что | Где | Зачем |
-| --- | --- | --- |
-| title | conversations | Список чатов без JOIN к messages |
-| updated_at | conversations | Сортировка списка без scan messages |
-| tokens_count | messages | Без повторного tokenize при чтении |
-| model | conversations + usage_records | Фильтрация без JOIN |
-| total_tokens | usage_records | Быстрая агрегация без суммирования полей |
-| Materialized views | ClickHouse | Предагрегация для billing dashboard |
+`subscription_tiers` и `models` — версионируемые reference tables. Полная копия раздаётся на каждый PG-шард через logical replication (лаг < 1 сек):
 
----
-
-## 6.6 Шардирование, резервирование и регион размещения
-
-GPU-кластеры — только в US (см. §3.2), durable state синхронизирован с этим: PostgreSQL и ClickHouse централизованы в US, ScyllaDB размазан по всем регионам, Redis — per-region (locality для auth/rate-limit).
-
-Используемые сокращения: **RF** (Replication Factor) — сколько копий каждой строки хранится в кластере (для PG это 1 primary + N replica; для Scylla — суммарно по всем DC); **AZ** (Availability Zone) — изолированная группа стоек внутри одного дата-центра, отказ одной AZ не должен ронять кластер; **RPO** (Recovery Point Objective) — макс. допустимая потеря данных по времени при катастрофе; **RTO** (Recovery Time Objective) — макс. время восстановления.
-
-| СУБД | Shard Key | Шардов | Репликация (RF / replicas) | Регион размещения | Нод |
-| --- | --- | --- | --- | --- | --- |
-| PostgreSQL (users / conversations / api_keys / attachments_metadata) | hash(user_id) % 64 | 64 | RF=3: 1 primary + 1 sync replica (другая AZ в US East) + 1 async replica (US West) | **Только US East+West.** EU/APAC ходят за PG-данными в US (+80–150 мс на lookup; sessions кэшируются локально в Redis) | 64 × 3 = 192 |
-| PostgreSQL (billing_accounts) | hash(user_id) % 32 | 32 | RF=3: 1 primary + 1 sync replica (same AZ, RPO=0) + 1 async replica (US West, cross-DC, RPO ≤5 сек) | **Только US East** (централизованно, для SERIALIZABLE без distributed coordination) | 32 × 3 = 96 |
-| ScyllaDB (messages) | Murmur3(conv_id) — hash-функция Cassandra/Scylla, маршрутизирует partition key на ноду | auto | **Multi-DC**: RF=3 в US East+West (multi-DC keyspace разрешает разный RF в DC) + RF=1 в EU + RF=1 в APAC, total RF=5. Кворум `LOCAL_QUORUM` (2 из 3 локальных в US) на запись/чтение; EU/APAC читают свой RF=1 для свежих диалогов | 4 региона: 12 нод US (RF=3) + 6 EU (RF=1) + 6 APAC (RF=1) | 24 |
-| Redis (sessions / rate_limits) | CRC16 hash slots | 128 per region | 1 primary + 1 replica на slot | **Per-region** (4 региона). Sessions локальны для auth-latency; rate_limits локальны (без cross-region sync, см. §6.5) | 128 × 2 × 4 = 1024 |
-| ClickHouse (usage_records) | hash(user_id) % 8 | 8 | 2 replicas per shard | **Только US East** (централизованно). Async insert от Chat Service из всех регионов (тред биллинг-инсертов терпит +150 мс) | 8 × 2 = 16 |
-| S3 (attachments blob) | Region bucket | — | S3 native (3+ AZ, durability 99.999999999%) + cross-region replication для DR | **Региональные buckets** в US East+West (рядом с GPU pool — для multimodal pull); EU/APAC bucket-ы только для регуляторики | managed |
-| PostgreSQL (audit_log) | PARTITION BY created_at (daily) + hash(user_id) % 16 | 16 | 1 primary + 1 async replica | **Только US East** | 32 |
-
-### Обоснование ключей шардирования
-
-| СУБД | Почему такой ключ |
-| --- | --- |
-| PostgreSQL (user-centric) | `user_id` — все объекты пользователя (conversations, api_keys, attachments_metadata) на одном шарде, нет cross-shard JOIN при `GET /v1/profile` или `GET /v1/conversations` |
-| billing_accounts | `user_id`, отдельный централизованный кластер в US East — reserve/finalize всегда попадают на одну primary-реплику, SERIALIZABLE-транзакции без distributed coordination |
-| ScyllaDB | `conv_id` — все сообщения диалога в одной партиции, типичный запрос `WHERE conv_id = ? LIMIT 50` обслуживается одной нодой без cross-shard scatter |
-| Redis | Стандартный CRC16 по ключу (`sess:{token}` / `rl:{user_id}`), равномерное распределение |
-| ClickHouse | `user_id` — агрегации billing-дашбордов по пользователю без distributed JOIN |
-| S3 | Bucket-per-region — клиент льёт presigned PUT в ближайший регион, сводит latency upload к одному hop |
-
-<!-- Развёрнутые обоснования размещения каждой СУБД (EU/APAC latency, RF=5 storage cost, per-region Redis) — в notes/defense-cheatsheet.md, секция «Почему БД размещены так — что это даёт?» -->
-Главное правило размещения: **durable state — рядом с GPU (US)**, **per-region — только то, что критично по latency на каждый HTTP-запрос** (Redis sessions/rate_limits). Промежуточные tier-ы (Scylla с RF=1 в EU/APAC) — компромисс между storage cost и UX.
-
----
-
-## 6.7 Клиентские библиотеки и балансировка подключений
-
-| СУБД | Клиентская библиотека | Connection Pool / Proxy |
-| --- | --- | --- |
-| PostgreSQL | asyncpg (Python), pgx (Go) | PgBouncer (transaction mode) |
-| ScyllaDB | scylla-driver, gocql | Token-aware routing (built-in) |
-| Redis | redis-py, go-redis | Redis Cluster routing (built-in) |
-| ClickHouse | clickhouse-connect | HTTP interface с async insert, connection reuse |
-
-### Балансировка запросов к PostgreSQL
-
-```mermaid
-graph TD
-    App["Application"] --> PgB["PgBouncer"]
-    PgB -->|"writes"| Primary["Primary"]
-    PgB -->|"reads"| R1["Replica 1"]
-    PgB -->|"reads"| R2["Replica 2"]
+```sql
+SELECT create_reference_table('subscription_tiers');
+SELECT create_reference_table('models');
 ```
 
-- **Writes** → Primary only
-- **Reads** → реплики через round-robin
-- PgBouncer в transaction mode, max 100 connections per pool
+При изменении цены или лимита: INSERT новой строки с новым UUID + UPDATE старой `effective_to = NOW()`. Старые `usage_records`, ссылающиеся на старый `tier_id` / `model_id`, продолжают видеть исторические значения — аналитика по выручке стабильна.
+
+### 6.4.4 Количество шардов
+
+| Таблица | Шардов | Обоснование |
+| --- | --- | --- |
+| users + colocated | 64 | 1 млрд users / 64 ≈ 15.6 млн строк на shard; один shard помещается в RAM worker-узла для hot-set |
+| billing_accounts | 32 | 100 млн API-юзеров / 32 ≈ 3 млн строк на shard; меньше шардов — меньше distributed transaction overhead на reserve/finalize |
+| audit_log | 16 | Партиционирование по дате — основной механизм; шардирование по user_id внутри партиции для security-расследований |
 
 ---
 
-## 6.8 Схема резервного копирования
+## 6.5 Шардирование ScyllaDB
 
-| СУБД | Метод | Периодичность | Хранение | RPO | RTO |
-| --- | --- | --- | --- | --- | --- |
-| PostgreSQL (user data) | pg_basebackup + WAL archiving | Full: ежедневно, WAL: непрерывно | S3, 30 дней | < 1 мин | < 15 мин |
-| PostgreSQL (billing_accounts) | pg_basebackup + WAL streaming | Full: ежедневно, WAL: sync replica в той же AZ + async replica в US West | S3, 1 год (регуляторика) | **0** внутри AZ / **≤5 сек** cross-DC | < 5 мин (promote sync-реплики) |
-| ScyllaDB | nodetool snapshot | Ежедневно | S3, 14 дней | < 1 час | < 1 час |
-| Redis (sessions) | RDB + AOF | RDB: ежечасно, AOF: always | S3, 7 дней | < 1 сек | < 5 мин |
-| Redis (rate_limits) | не бэкапится | — | — | TTL 60 сек | моментально (восстанавливается из живого трафика) |
-| ClickHouse | BACKUP TABLE → S3 | Ежедневно | S3, 90 дней | < 24 часа | < 1 час |
-| PostgreSQL (attachments метаданные) | pg_basebackup + WAL | Full: ежедневно, WAL: непрерывно | S3, 30 дней | < 1 мин | < 15 мин |
-| S3 (attachments blob) | Cross-region replication + Object Versioning | Непрерывно | S3 Glacier (>90 дней), 3 года | < 15 мин | managed (native) |
-| PostgreSQL (audit_log) | pg_basebackup + WAL + dump старых партиций | WAL: непрерывно, партиции старше 1 года → S3 | S3, 7 лет (compliance) | < 1 мин | < 30 мин |
+Для `messages` partition key — `conv_id`, hash-функция Murmur3 маршрутизирует партицию на ноду кластера. Все сообщения одного диалога физически лежат на одной ноде → типичный запрос `WHERE conv_id=? LIMIT 50` обслуживается одним partition-read без cross-node coordinator.
 
-*Примечание: in-flight-состояние inference (назначения request→worker в Scheduler, буферы gRPC-стримов) не бэкапится — клиент при сбое ретраит запрос.*
+```cql
+CREATE TABLE messages (
+    conv_id           UUID,
+    created_at        TIMESTAMP,
+    message_id        UUID,
+    parent_message_id UUID,
+    request_id        UUID,
+    role              TEXT,
+    model_id          UUID,
+    content           TEXT,
+    tokens_count      INT,
+    finish_reason     TEXT,
+    PRIMARY KEY (conv_id, created_at, message_id)
+) WITH CLUSTERING ORDER BY (created_at DESC, message_id ASC);
+```
 
----
+`DESC` оптимизирует «последние N сообщений» (самые свежие читаются с начала SSTable); `message_id` — tiebreaker на случай одновременных вставок.
 
-## 6.9 API-вызов в СУБД
+**Multi-DC keyspace**: RF=3 в US East+West (LOCAL_QUORUM 2/3 на запись/чтение) + RF=1 в EU + RF=1 в APAC, итого RF=5. Локальное чтение в EU/APAC спасает UX (открытие диалога без round-trip в US); сторонним эффектом приходит storage cost ×1.7 (4.57 ПБ × 1.7 = 7.8 ПБ effective).
 
-Связка типового запроса с физическими объектами — какие СУБД задействованы и в каком порядке.
+**Materialized View** `messages_by_request` — Scylla автоматически поддерживает копию с другим partition key (`request_id`). Это даёт O(1)-lookup «найти оба сообщения цикла по `request_id`» (audit, support, GDPR) ценой ×1.05 storage и +1 write per insert. Hot-path по `conv_id` не затрагивается. Альтернатива — Secondary Index — реализована через distributed scatter-gather, latency нестабильна на PB-объёмах.
 
-| API-вызов | Канал | Физические объекты | Что происходит |
+Запрос без partition key (`WHERE message_id=?`) — full scan, **антипаттерн**, запрещён в API.
+
+### Количество нод
+
+| Регион | RF | Объём данных (year 1) | Нод |
 | --- | --- | --- | --- |
-| `POST /v1/auth/login` | Web | PG `users`, Redis `sessions` | SELECT users по email → bcrypt verify → INSERT sess:`{token_hash}` в Redis с TTL=24h |
-| `Authorization: Bearer ...` (auth check на каждый запрос) | Web / API | Redis `sessions` или PG `api_keys` | Web: GET sess:`{token_hash}` из Redis (1 ms); API: SELECT api_keys по `key_hash` (cached на TTL=60s) |
-| `Rate-limit check` (на каждый запрос) | Web / API | Redis `rate_limits` | Lua `check_and_incr(user_id, cost)` — атомарный inc + проверка лимита; на превышение — 429 |
-| `GET /v1/conversations` | Web | PG `conversations` | SELECT conv_id, title, updated_at WHERE user_id=? ORDER BY updated_at DESC LIMIT 100 (single shard, IDX `(user_id, updated_at DESC)`) |
-| `GET /v1/conversations/{id}/messages` | Web | PG `conversations` (ACL) + ScyllaDB `messages` | SELECT user_id FROM conversations WHERE conv_id=? (ACL); затем SELECT * FROM messages WHERE conv_id=? LIMIT 50 (single Scylla partition) |
-| `POST /v1/chat/completions` (Web) | Web | PG `billing_accounts` (опц.) → ScyllaDB `messages` (insert user) → in-memory inference → ScyllaDB `messages` (insert assistant) → PG `billing_accounts` (finalize) → ClickHouse `usage_records` | См. поток в §6.3 «Поток usage-событий без Kafka»; PG-операции — только для tier с токеновым биллингом |
-| `POST /v1/chat/completions` (API) | API | PG `api_keys` (auth) → PG `billing_accounts` (reserve) → in-memory inference → PG `billing_accounts` (finalize) → ClickHouse `usage_records` | API stateless — в `messages` ничего не пишется. Reserve/finalize — SERIALIZABLE-транзакция в PG US East |
-| `POST /v1/files` (presigned upload) | Web | PG `attachments_metadata` | INSERT в `attachments` со статусом `uploading`; возвращается presigned PUT URL → клиент льёт в S3 → S3 event обновляет статус на `ready` |
-| `GET /v1/billing/usage` (dashboard) | Web | ClickHouse `usage_records` | SELECT SUM(cost) FROM usage_records WHERE user_id=? AND created_at > ? GROUP BY toStartOfDay(created_at) — single-shard агрегация по `ORDER BY (user_id, created_at)` |
-| Audit-событие (login, key_created, ...) | Web / API | PG `audit_log` | Append-only INSERT в текущую дневную партицию; security-investigations читают по индексу `(user_id, created_at)` |
-
-`POST /v1/chat/completions` — самый «многоэтапный» вызов: 5–6 СУБД-операций на цикл, но критичный путь (TTFT) проходит только через auth + rate-limit + billing reserve, всё остальное — после стрима.
+| US East | 3 | 13.7 ПБ (4.57 × 3) | 6 |
+| US West | 3 | 13.7 ПБ | 6 |
+| EU Central | 1 | 4.57 ПБ | 6 |
+| APAC | 1 | 4.57 ПБ | 6 |
+| **Итого** | | | **24** |
 
 ---
 
-## 6.10 Сводная таблица физической схемы
+## 6.6 Шардирование ClickHouse
 
-| Таблица | СУБД | Shard Key | Шардов | Реплик / RF | Регион | Нод | Ключевые индексы |
-| --- | --- | --- | --- | --- | --- | --- | --- |
-| users | PostgreSQL | hash(user_id) | 64 | 1 primary + 2 replica | US East+West | 192 (colocated) | PK user_id, UNIQUE email |
-| conversations | PostgreSQL | hash(user_id) | 64 | colocated с users | US East+West | colocated | PK conv_id, IDX (user_id, updated_at) |
-| api_keys | PostgreSQL | hash(user_id) | 64 | colocated с users | US East+West | colocated | PK key_id, IDX key_hash |
-| attachments (метаданные) | PostgreSQL | hash(user_id) | 64 | colocated с users | US East+West | colocated | PK attachment_id, IDX (message_id), IDX (user_id, created_at) |
-| messages | ScyllaDB | Murmur3(conv_id) | auto | RF=3 (US) + RF=1 (EU) + RF=1 (APAC) = total RF=5 | Все 4 ДЦ | 12 US + 6 EU + 6 APAC = 24 | Partition conv_id, Cluster (created_at DESC, message_id) |
-| sessions | Redis | CRC16 | 128 / region | 1 master + 1 replica | Per-region (×4) | 256 × 4 = 1024 | KEY sess:{token_hash}, TTL 24h |
-| rate_limits | Redis | CRC16 | colocated | 1 master + 1 replica | Per-region (×4) | colocated с sessions | KEY rl:{user_id}, Lua atomic |
-| billing_accounts | PostgreSQL | hash(user_id) | 32 | 1 primary + sync replica (same AZ) + async (US West) | **US East only** | 32 × 3 = 96 | PK user_id, partial IDX (tier, balance) |
-| usage_records | ClickHouse | hash(user_id) | 8 | 2 replicas / shard | **US East only** | 8 × 2 = 16 | ORDER BY (user_id, created_at), PARTITION BY toYYYYMM |
-| attachments (blob) | S3 | region-bucket | — | S3 native (3+ AZ, durability 99.999999999%) + cross-region replication | US East+West (origin), EU/APAC (replicas) | managed | — |
-| audit_log | PostgreSQL | partition (created_at) + hash(user_id) | 16 | 1 primary + 1 async replica | US East only | 32 | PK (created_at_partition, event_id), IDX (user_id, created_at) |
+`usage_records` — append-only OLAP, типовой запрос `GROUP BY user_id`. Шардирование по `hash(user_id) % 8`, ReplicatedMergeTree с 2 репликами на shard.
+
+```sql
+CREATE TABLE usage_records ON CLUSTER analytics (
+    record_id        UUID,
+    user_id          UUID,
+    request_id       UUID,
+    model_id         UUID,
+    channel          LowCardinality(String),
+    prompt_tokens    UInt32,
+    completion_tokens UInt32,
+    cost             Decimal64(6),
+    created_at       DateTime
+) ENGINE = ReplicatedMergeTree
+PARTITION BY toYYYYMM(created_at)
+ORDER BY (user_id, created_at)
+SETTINGS index_granularity = 8192;
+
+ALTER TABLE usage_records ADD INDEX request_id_bloom request_id TYPE bloom_filter GRANULARITY 4;
+```
+
+Партиции по месяцу: hot-данные за 3 месяца на NVMe, older — на HDD-tier, после 1 года — drop партиции. Skipping bloom_filter по `request_id` для audit-запросов, не мешая агрегации по `(user_id, created_at)`.
+
+`cost` зафиксирован в момент записи (денормализация, см. §6.10) — ClickHouse не делает JOIN с `models` на hot-path. Разбивка выручки по моделям — batch-задача с external dictionary (PG как источник, refresh 5 мин).
+
+Кластер централизован в US East (8 shards × 2 replicas = 16 нод). Регионалы льют биллинг через HTTP async insert (терпит +150 мс, биллинг — не критичный путь).
+
+---
+
+## 6.7 Объектное хранилище Ceph RGW
+
+Bucket в S3-совместимом API — логический контейнер для объектов. Разные buckets имеют разные политики доступа, lifecycle и шифрование.
+
+| Bucket | Назначение | Lifecycle |
+| --- | --- | --- |
+| `llm-attachments-{region}` | Пользовательские вложения (изображения, документы) | hot 90 дней → cold (HDD-tier) 3 года |
+| `llm-backups` | Бэкапы PG / Scylla / CH / Redis | per-СУБД, см. §6.12 |
+| `llm-audit-archive` | Партиции `audit_log` старше 1 года | 7 лет (compliance) |
+
+Хранилище ключей пользователей — `{user_id}/{attachment_id}`. Это и шардирующий ключ для CRUSH-алгоритма Ceph: один объект разбивается на data + parity chunks и раскладывается по разным OSD-узлам (failure domain = rack/host) на основе CRUSH map.
+
+### Сайзинг
+
+Целевой объём — 126 ПБ/год накопления (см. §2.4). Hot-tier (год активного хранения) + cold-tier (1–3 года) = 378 ПБ raw. Erasure Coding 8+3 (8 data chunks + 3 parity, переживает потерю 3 OSD на объект, overhead ×1.375 vs ×3 у replication):
+
+```text
+Physical_capacity = 378 ПБ × 1.375 ≈ 520 ПБ
+OSD_node_capacity = 24 × 18 TB HDD = 432 TB
+Nodes_total = 520 ПБ / 432 TB ≈ 1 200 OSD-нод
+Service_nodes = 3 (MON/MGR/RGW) × 4 региона = 12 узлов
+```
+
+Распределение по регионам: US East ≈ 480 (40%), US West ≈ 360 (30%, основной DR-таргет), EU ≈ 240 (20%), APAC ≈ 120 (10%). Multisite-репликация US East → US West (sync) + US East → EU/APAC (async, для регуляторики).
+
+Доступ приложений: `POST /v1/files` выдаёт presigned PUT URL → клиент льёт файл напрямую в региональный RGW endpoint, минуя ingress-nginx. Bucket-notification (S3-event) обновляет `attachments.status = ready` в PG.
+
+---
+
+## 6.8 Кэширование и rate limiting (Redis Cluster)
+
+Redis Cluster в каждом регионе обслуживает 4 паттерна:
+
+| Ключ | Тип | TTL | Назначение |
+| --- | --- | --- | --- |
+| `sess:{token_hash}` | String (JSON) | 24h | Сессия Web-юзера: `{user_id, tier_id, expires_at}` |
+| `rl:{user_id}` | Hash | 60s | Sliding-window счётчики `request_count` / `token_count` |
+| `tier:{tier_id}` | Hash | 300s | Кеш атрибутов справочника `subscription_tiers` (`rps_limit`, `tpm_limit`) |
+| `model:{model_id}` | Hash | 300s | Кеш атрибутов справочника `models` (цены, `max_context`) |
+
+Ключи распределяются Redis Cluster по 16 384 hash slots; на каждый master-slot — 1 replica для failover.
+
+Rate Limiter использует Lua-скрипт `check_and_incr(user_id, tier_id, cost_tokens)`:
+1. `HMGET tier:{tier_id} rps_limit tpm_limit` (миссы ~1% → read-through из PG);
+2. `HMGET rl:{user_id} request_count token_count`;
+3. проверка лимитов → `DENY` (HTTP 429) или продолжение;
+4. `HINCRBY` обоих счётчиков + `EXPIRE 60`;
+5. `ALLOW`.
+
+Это даёт атомарную проверку + инкремент за один RTT под 173 200 RPS пика. `tier_id` приходит из session, кешируется в `tier_cache` на 5 мин; изменение тарифа долетает через pub/sub-канал `cache:invalidate` (lag < 1 сек).
+
+`tier_cache` и `model_cache` — это read-through кеши справочников; источник истины — PG, см. §6.4.3. Сами `sess:` и `rl:` cross-region не реплицируются — пользователь привязан к региону Anycast (см. §3).
+
+---
+
+## 6.9 Индексы
+
+| Таблица | Индекс | Тип | Зачем |
+| --- | --- | --- | --- |
+| `subscription_tiers` | PK `tier_id` | B-tree | FK target |
+| `subscription_tiers` | `(tier_code) WHERE effective_to IS NULL` | Partial B-tree | Найти активную версию тарифа по коду |
+| `models` | PK `model_id` | B-tree | FK target |
+| `models` | `(model_code) WHERE effective_to IS NULL` | Partial B-tree | Найти активную версию модели по коду |
+| `users` | UNIQUE `email` | B-tree | Login |
+| `users` | `(tier_id)` | B-tree | Аналитика «сколько юзеров на каждом тарифе» |
+| `conversations` | `(user_id, updated_at DESC)` | B-tree | Список чатов с сортировкой |
+| `api_keys` | `key_hash` | B-tree | Валидация API-ключа на каждый запрос |
+| `billing_accounts` | `(balance) WHERE balance < threshold` | Partial B-tree | Проактивные уведомления о низком балансе |
+| `attachments` | `(message_id)`, `(request_id)`, `(user_id, created_at DESC)` | B-tree | Список вложений сообщения, audit-lookup по request_id, квоты юзера |
+| `audit_log` | `(user_id, created_at DESC)` per partition | B-tree | Security investigation |
+| `messages` | Partition `conv_id`, Clustering `(created_at DESC, message_id)` | Scylla SSTable | Все сообщения чата на одной ноде, обратный хронологический порядок |
+| `messages_by_request` | Partition `request_id` | Scylla Materialized View | O(1) lookup всех сообщений цикла по request_id |
+| `usage_records` | ORDER BY `(user_id, created_at)`, PARTITION BY `toYYYYMM` | MergeTree | Агрегации по юзеру + быстрое удаление старых партиций |
+| `usage_records` | `request_id` | bloom_filter (8k granule) | Точечный lookup без нагрузки на hot-path аналитики |
+| `sessions`, `rate_limits` | по ключу | Redis hash | O(1) lookup |
+
+---
+
+## 6.10 Денормализация
+
+| Поле | Где | Зачем |
+| --- | --- | --- |
+| `conversations.title`, `conversations.updated_at` | PG | Список чатов без JOIN к `messages` и без scan |
+| `messages.tokens_count` | Scylla | Без повторного tokenize при чтении |
+| `messages.model_id` (только для `role=assistant`) | Scylla | UI-ярлычок «дано моделью X» одним lookup в `model_cache`, без JOIN с `usage_records` через `request_id` |
+| `usage_records.cost` | ClickHouse | Цена per-token зафиксирована в момент записи; CH не делает JOIN с прайс-листом в hot-path |
+| Reference tables `subscription_tiers` / `models` на каждом PG-шарде | PG | Локальный JOIN `users → subscription_tiers` без cross-shard hop; overhead ~12 КБ на шард |
+
+---
+
+## 6.11 Клиентские библиотеки и пулы подключений
+
+| СУБД | Клиентская библиотека | Connection pool / proxy | Балансировка |
+| --- | --- | --- | --- |
+| PostgreSQL | asyncpg (Python), pgx (Go) | PgBouncer в transaction mode | Writes → primary, reads → replicas (round-robin) |
+| ScyllaDB | scylla-driver, gocql | Built-in token-aware routing | Драйвер сам знает, на какой ноде лежит партиция, обходит coordinator-hop |
+| Redis | redis-py, go-redis | Redis Cluster routing (built-in) | Клиент знает hash-slot → master mapping, шлёт команду сразу на нужную ноду |
+| ClickHouse | clickhouse-connect | HTTP-интерфейс с async insert и connection reuse | Distributed-таблица на одной ноде сама шлёт на shards |
+| Ceph RGW | boto3 / aws-sdk-go (S3 API) | HTTP keep-alive | Клиент льёт presigned PUT напрямую в региональный endpoint |
+
+PgBouncer стоит перед каждым PG-кластером (transaction mode, лимит 100 connections per pool), что снимает overhead открытия соединения на каждый HTTP-запрос (asyncpg + PgBouncer = ~0.3 мс на acquire).
+
+---
+
+## 6.12 Резервное копирование
+
+| Хранилище | Способ | Хранение | RPO | RTO |
+| --- | --- | --- | --- | --- |
+| PostgreSQL (user data) | pg_basebackup + WAL archiving (PITR) | Ceph RGW, 30 дней | < 1 мин | < 15 мин |
+| PostgreSQL (billing_accounts) | pg_basebackup + WAL streaming + sync replica (same AZ) + async replica (US West) | Ceph RGW, 1 год | 0 внутри AZ / ≤5 сек cross-DC | < 5 мин (promote sync-replica) |
+| PostgreSQL (attachments_metadata) | pg_basebackup + WAL archiving | Ceph RGW, 30 дней | < 1 мин | < 15 мин |
+| PostgreSQL (audit_log) | pg_basebackup + WAL + dump старых партиций | Ceph cold-tier, 7 лет (compliance) | < 1 мин | < 30 мин |
+| ScyllaDB | nodetool snapshot, ежедневно | Ceph RGW, 14 дней | < 1 час | < 1 час |
+| ClickHouse | BACKUP TABLE → Ceph RGW, ежедневно | Ceph RGW, 90 дней | < 24 часа | < 1 час |
+| Redis (sessions) | RDB ежечасно + AOF always | Ceph RGW, 7 дней | < 1 сек | < 5 мин |
+| Redis (rate_limits) | не бэкапится | — | TTL 60 сек | моментально (восстанавливается из живого трафика) |
+| Ceph RGW (attachments blob) | Multisite-replication + Object Versioning | EC 8+3 + cold-tier 3 года | < 15 мин | native (RGW failover) |
+
+Кэш Redis и in-flight inference-состояние единственным источником истины не являются: при полной потере sessions создаются заново на логине, rate-limits — из текущего трафика, in-flight inference — клиент ретраит запрос с тем же `request_id`. Для PG WAL-archiving позволяет восстановить кластер до точного момента времени.
 
 # Источники
 

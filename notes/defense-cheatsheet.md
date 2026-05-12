@@ -115,6 +115,21 @@
 
 ## §5–§6 Базы данных
 
+### Ключевые архитектурные решения
+
+**Ключевые архитектурные решения:**
+
+* **Справочники с бизнес-атрибутами.** `subscription_tiers` и `models` — single source of truth для тарифов (`tier_code` FK на `users`) и моделей (`model_code` FK на `messages` и `usage_records`). Цены per-1k токенов — индустриальный стандарт (OpenAI / Anthropic API): per-token (`$0.000005`) даёт нечитаемые числа в DECIMAL, per-million — норм, но 1k привычнее.
+* **`model_code` живёт на `messages` (не на `conversations`).** Модель может меняться внутри одного диалога (юзер переключился с `gpt-4o-mini` на `gpt-4o` для сложного вопроса). Поле заполняется только для `role=assistant` (NULL для user). Это даёт честный audit «каким именно ответом был дан этот ответ» и убирает фиктивный «default model» на conversation.
+* **`channel` (web/api) на `usage_records` оставлен.** Это **источник вызова**, не derived из `tier_code`: plus-юзер может вызывать через personal API. Нужен для (1) маржинальности по revenue streams, (2) quota policy (Web token-quota vs API balance), (3) abuse-детекции, (4) disputes по каналу.
+* **`billing_accounts` хранит только деньги.** `tier_code` ушёл на `users` — биллинг знает про `balance` / `reserved`, а тариф — это свойство аккаунта.
+* **`rate_limits` хранит только счётчики.** Лимиты (`rps_limit` / `tpm_limit`) — в справочнике `subscription_tiers`, читаются через Redis-кеш `tier:{tier_code}` — UPDATE миллионов строк при ребрендинге линейки не нужен.
+* **Трассировка request → response:** `messages.parent_message_id` (self-FK) — явная связь «assistant отвечает на user», закрывает regenerate / branching / audit. `messages.request_id` / `usage_records.request_id` / `attachments.request_id` — общий correlation ID одного inference-цикла, совпадает с `X-Request-ID` HTTP-ответа и `trace_id` в Tempo.
+* **Sessions упрощены.** Только `token_hash` (PK Redis-ключа `sess:{token_hash}`), `user_id`, `created_at`, `expires_at`. IP / User-Agent / device fingerprint **не хранятся** — для security-аудита есть `audit_log` с событиями `login_success`. Это убрало 280 B per row × 1 млрд = ~280 ГБ Redis RAM.
+* **Attachments упрощены.** Метаданные содержат только то, что нужно в hot-path: ссылку в S3, mime_type для UI и `status` (uploading → ready → deleted). `size_bytes` и `sha256` (под дедупликацию) — отложены до when-needed; первое достанется через S3 HeadObject, второе требует content-addressable storage (отдельная фича).
+* **`api_keys.last_used_at` убран.** Иначе UPDATE на каждом API-запросе (8 680 RPS). Если понадобится — derived: `SELECT MAX(created_at) FROM usage_records WHERE user_id=? AND channel='api'`.
+* **ENUM оставлены** там, где у значения нет бизнес-атрибутов: `messages.role`, `attachments.status`, `usage_records.channel`, `audit_log.event_type`. Обоснование «ENUM vs справочник» — §6.1.
+
 ### «Почему 5 СУБД, а не одна?»
 
 Разные паттерны нагрузки несовместимы в одном движке:
@@ -123,7 +138,35 @@
 - **OLTP key-value in-memory** (sessions 95 700 RPS, rate_limits 173 200 RPS) — Redis: latency < 1 мс на каждый HTTP-запрос. PG бы добавил +5 мс ко всему.
 - **OLTP wide-column, write-heavy** (messages 58k RPS write, 4.5 ПБ/год) — ScyllaDB: PB-объём + write-throughput. PG/Citus упрётся в дисковый I/O.
 - **OLAP колоночный** (usage_records 250 ТБ/год, агрегации SUM tokens/cost) — ClickHouse: LZ4 ×10 сжатие, MergeTree, PARTITION BY toYYYYMM. PG бы делал агрегации минутами.
-- **Object storage** (attachments blob, 126 ПБ/год) — S3: cheap cold-storage, native cross-region replication, 11-nines durability. Самописный blob-store на дисках — re-invent.
+- **Object storage** (attachments blob, 126 ПБ/год) — Ceph RGW: self-hosted S3-совместимый, дешевле managed S3 в десятки раз на нашем объёме, согласован с on-prem архитектурой.
+
+### «Почему `subscription_tiers` и `models` — версионируемые таблицы с UUID PK?»
+
+Если PK = `tier_code` (`'plus'`) и мы UPDATE-им цену, то все исторические `usage_records`, ссылающиеся на этот код, начинают через JOIN показывать новую цену — **исторический revenue ломается на ровном месте**. Решение: PK = UUID, при изменении тарифа INSERT новой строки + UPDATE старой `effective_to = NOW()`. Старые `usage_records` ссылаются на старый `tier_id`, бизнес-аналитика по выручке стабильна.
+
+Альтернативы:
+- **SCD type 2** в OLAP — то же самое, но на стороне CH; мы оставили SoT в PG и реплицируем версии справочника, потому что цены меняет продакт, а не аналитика.
+- **Хранить snapshot цены в каждом `usage_records.cost`** (мы и так это делаем — `cost` денормализован) — но `model_id` всё равно нужен для разбивки по моделям; без версионности при rename модели сломается фильтр по моделям.
+
+### «Почему MVP без multi-currency?»
+
+Multi-currency требует:
+1. Сервиса FX-rates (живые курсы, fallback при сбое провайдера).
+2. Conversion-time pricing — фиксируем курс в момент списания, не в момент инвойса.
+3. Audit на rate-shifts — комплаенс требует знать, какой курс применён к транзакции.
+4. UI/инвойсы под локали и форматы валют.
+
+Это самостоятельный модуль уровня billing-сервиса. В MVP — только USD; multi-currency — отдельный roadmap-эпик после launch.
+
+### «Почему Ceph RGW, а не managed S3?»
+
+На 126 ПБ/год накопления:
+- **Стоимость хранения** managed S3 (Standard) ≈ $0.023/ГБ/мес = 126 ПБ × 12 мес × $23 000/ПБ ≈ $35M/год только на storage. Cold-tier (Glacier Instant) дешевле в ~5 раз, но на свежих данных не помогает.
+- **Egress** managed S3 на multimodal pull в GPU pool — внутри одного региона бесплатно, но cross-region — $0.02/ГБ. У нас 64.81 Гбит/с пик → ~210 ТБ/час egress, что бьёт в десятки $M/год.
+- **Self-hosted Ceph RGW** на наших OSD-нодах (HDD + NVMe metadata) с EC 8+3 даёт сопоставимую durability при ×3–×5 экономии CAPEX за горизонт 3 лет. Erasure Coding 8+3 переживает потерю 3 дисков из 11 на объект; при наших ~1 200 OSD-нодах вероятность одновременного отказа 4+ дисков на одном PG-объекте — ничтожна (CRUSH алгоритм размазывает chunks по разным failure domains).
+- **MinIO** отклонён: основной репозиторий `minio/minio` в начале 2026 года переведён в read-only режим — это операционный риск для прод-системы.
+
+«А почему не SeaweedFS / RustFS / Garage?» — Garage и RustFS подходят для small/medium на единицы ПБ; Ceph — индустриальный стандарт для десятков ПБ и выше, с зрелым multisite-replication и интеграцией в k8s через Rook.
 
 ### «Почему БД размещены так — что это даёт?»
 
