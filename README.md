@@ -403,6 +403,32 @@ flowchart TD
 
 ---
 
+## 3.6 Cross-DC inference-трафик
+
+GPU только в США (§3.2) — значит **65% inference-запросов** (EU 35% + APAC 30%) физически летит из ДЦ-приёмника в US-GPU. Это самостоятельный существенный тип трафика, и сетевые интерфейсы edge-роутеров EU/APAC и обоих US-ДЦ должны его держать.
+
+**Peak-нагрузка (пиковые RPS из §2.3 × доля cross-DC 0.65):**
+
+В GPU при каждом запросе отправляется **полный контекст** — для API это сам payload запроса (stateless, §2.2), для Web сервер собирает контекст из БД. Берём для обоих консервативную оценку 25 КБ (~6000 токенов, как у API).
+
+| Направление                | Поток        | Расчёт                          |  Peak Гбит/с |
+| -------------------------- | ------------ | ------------------------------- | -----------: |
+| EU+APAC → US (вход на GPU) | Web context  | 57 870 × 0.65 × 25 КБ           |          7.5 |
+| EU+APAC → US (вход на GPU) | Web вложения | 57 870 × 0.65 × 0.07 × 2 МБ     |         42.1 |
+| EU+APAC → US (вход на GPU) | API context  | 78 125 × 0.65 × 25 КБ           |         10.2 |
+| US → EU+APAC (SSE назад)   | Web SSE      | 57 870 × 0.65 × 9 КБ            |          2.7 |
+| US → EU+APAC (SSE назад)   | API SSE      | 78 125 × 0.65 × 7 КБ            |          2.8 |
+| **Итого**                  |              |                                 | **~60 in / ~5.5 out** |
+
+Среднесуточно (peak ÷ 2) — ~30 Гбит/с inbound в US, что даёт ~324 ТБ/сутки cross-DC. Доминируют Web-вложения (~70% потока): на больших объёмах их имеет смысл сжимать и токенизировать ближе к клиенту (EU/APAC `files` pod), а в US-GPU прокидывать уже компактные эмбеддинги — это снижает cross-DC до ~18 Гбит/с peak.
+
+
+**Транспорт.** Все 4 ДЦ соединены **выделенными каналами связи** (арендованные у магистральных операторов), не через публичный Интернет.
+
+**Маршрутизация.** Internal BGP (iBGP) между edge-роутерами наших ДЦ. `regional-inference` (EU/APAC) через internal DNS получает primary-адрес `inference-scheduler.us-east.internal`; при недоступности US East переключается на `inference-scheduler.us-west.internal` (см. §3.5).
+
+---
+
 # 4. Локальная балансировка нагрузки
 
 §4 описывает балансировку **внутри одного ДЦ** — после того, как Anycast-пакет приземлился на пул edge-нод (§3.4).
@@ -428,7 +454,8 @@ flowchart LR
         SvcA["Service: api-gateway"]
         SvcC["Service: chat (SSE)"]
         SvcF["Service: files"]
-        SvcR["Service: regional-inference<br/>(US: + Inference Scheduler)"]
+        SvcR["Service: regional-inference"]
+        SvcS["Service: inference-scheduler<br/>(только US East / US West)"]
       end
 
       subgraph Gpu["GPU-ноды — только US East / US West"]
@@ -442,7 +469,8 @@ flowchart LR
       Ing --> SvcF
       SvcA -.->|"gRPC"| SvcR
       SvcC -.->|"gRPC"| SvcR
-      SvcR -.->|"gRPC server-streaming"| Gw
+      SvcR -.->|"US: локально<br/>EU/APAC: cross-DC §3.6"| SvcS
+      SvcS -.->|"gRPC server-streaming"| Gw
     end
 
     classDef cp fill:#f5e8ff,stroke:#7a3ad6;
@@ -452,12 +480,14 @@ flowchart LR
     classDef gpu fill:#ffe5e5,stroke:#d63a3a;
     class L4 l4;
     class Ing,Spk edge;
-    class SvcA,SvcC,SvcF,SvcR worker;
+    class SvcA,SvcC,SvcF,SvcR,SvcS worker;
     class Gw gpu;
     class ApiSrv cp;
 ```
 
-L4-плоскость (MetalLB) принимает Anycast-пакеты и распределяет их между edge-нодами. Внутри k8s-кластера ingress-nginx (L7) терминирует TLS и маршрутизирует HTTP по `Host` на k8s Service нужного бэкенда; Service балансирует уже на конкретные pod-ы на worker-нодах. Между сервисами (chat / api-gateway → regional-inference / Inference Scheduler → GPU Worker) — gRPC client-side LB: клиент сам ходит по списку endpoint-ов из k8s API. Control plane выделен отдельно — он управляет состоянием кластера, но **не находится на пути пользовательского трафика**.
+L4-плоскость (MetalLB) принимает Anycast-пакеты и распределяет их между edge-нодами. Внутри k8s-кластера ingress-nginx (L7) терминирует TLS и маршрутизирует HTTP по `Host` на k8s Service нужного бэкенда; Service балансирует уже на конкретные pod-ы на worker-нодах. Между сервисами (chat / api-gateway → regional-inference → inference-scheduler → GPU Worker) — gRPC client-side LB: клиент сам ходит по списку endpoint-ов из k8s API. Control plane выделен отдельно — он управляет состоянием кластера, но **не находится на пути пользовательского трафика**.
+
+**Cross-DC inference.** `inference-scheduler` и GPU-ноды живут только в US East / US West. В EU/APAC схема та же, но стрелка `regional-inference → inference-scheduler` уходит **из кластера ДЦ через cross-DC backbone в US** (§3.6) — `pod-to-pod` gRPC mTLS, минуя ingress-nginx обоих ДЦ. Поэтому ingress-nginx видит только клиентский HTTPS своего региона; cross-DC поток на его расчёт не влияет.
 
 ## 4.2 Пояснение к схеме
 
@@ -476,6 +506,8 @@ DaemonSet для ingress выбран, потому что edge-ноды dedicat
 Резервирование L7 — модель **2N @ 50%**: при отказе половины парка оставшиеся реплики выходят на 100% без деградации (расчёт в §4.3). Backend pod-ы — **N+1** + HPA: ingress сам ретраит запрос на следующий pod через `proxy_next_upstream` при отказе любого; pod, прошедший `readiness probe`, k8s автоматически добавляет в `Service` endpoints.
 
 ## 4.3 Расчёт числа балансировщиков
+
+Через ingress-nginx проходит только внешний клиентский HTTPS соответствующего ДЦ из §3.3. Cross-DC inference §3.6 идёт `pod-to-pod` по backbone (gRPC mTLS `regional-inference` → `inference-scheduler`), минуя ingress US — в расчёт ниже **не входит**.
 
 Сайзим по трём ограничителям: HTTPS RPS, TLS CPS (новые handshakes/сек) и пропускная способность сети.
 
