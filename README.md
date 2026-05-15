@@ -320,6 +320,8 @@ EU и APAC — только HTTP-слой (terminate TLS, держать SSE-с�
 | APAC      | 25 516       | 51 032        | 361 110             |
 | **Итого** | **85 054**   | **170 108**   | **1 203 700**       |
 
+Auth check (84 500 avg / 169 000 peak из §2.3) в этой таблице **не суммируется** — это не отдельный HTTP-запрос от клиента, а middleware-операция внутри pod-а (lookup в Redis `sess:{token_hash}` или валидация `api_key`), выполняемая на каждый внешний запрос. По нагрузке на ingress они уже учтены в `HTTP RPS peak`; по нагрузке на Redis — в §5.5.
+
 Все inference-запросы (67 998 avg / 135 996 peak RPS из §2) в итоге сходятся на GPU-кластерах в США независимо от того, в каком ДЦ они принимаются: EU/APAC — только HTTP-слой, проксирующий gRPC-стрим в US-GPU.
 
 ---
@@ -513,7 +515,7 @@ DaemonSet для ingress выбран, потому что edge-ноды dedicat
 
 Через ingress-nginx проходит только внешний клиентский HTTPS соответствующего ДЦ из §3.3. Cross-DC inference §3.6 идёт `pod-to-pod` по backbone (gRPC mTLS `regional-inference` → `inference-scheduler`), минуя ingress US — в расчёт ниже **не входит**.
 
-Сайзим по трём ограничителям: HTTPS RPS, TLS CPS (новые handshakes/сек) и пропускная способность сети.
+Сайзим по четырём ограничителям: HTTPS RPS, TLS CPS (новые handshakes/сек), пропускная способность сети и **число одновременных SSE-соединений** (для AI-чата критический фактор: стримы держатся 5–60 сек).
 
 | Характеристика (global peak)                  |     Значение |
 | --------------------------------------------- | -----------: |
@@ -521,24 +523,28 @@ DaemonSet для ingress выбран, потому что edge-ноды dedicat
 | Доля новых TLS-соединений [^14]               |          30% |
 | Пиковый TLS CPS (RPS × 0.3)                   |       51 032 |
 | Пиковая пропускная способность через ingress  | 25.10 Гбит/с |
-| HTTPS RPS на ноду 32 vCPU [^13] (запас 50%)   |       56 000 |
-| TLS CPS на ноду 32 vCPU [^13] (запас 50%)     |        6 600 |
-| Пропускная способность ноды (2×25 GbE NIC)    |  17.6 Гбит/с |
+| Пиковое число concurrent SSE                  |    1 203 700 |
+| HTTPS RPS на ноду 16 vCPU [^13] (запас 50%)   |      170 000 |
+| TLS CPS на ноду 16 vCPU [^13] (запас 50%)     |       28 000 |
+| Concurrent SSE на ноду (RAM + fd, запас 50%)  |      100 000 |
+| Пропускная способность ноды (1×25 GbE NIC)    |    22 Гбит/с |
 
-Бенчмарк [^13] даёт цифры для ingress-nginx Controller на 16 vCPU; мы используем edge-ноды 32 vCPU / 2×25 GbE NIC и масштабируем ×2. Запас 50% применяется к CPU-метрикам (RPS, CPS), не к throughput (NIC-bound). В бенчмарке метрика называется «SSL TPS» — это и есть новые TLS-handshakes в секунду.
+Бенчмарк [^13] для ingress-nginx Controller показывает плато после 16 vCPU: на 16 CPU — 341 232 HTTPS RPS и 56 715 SSL TPS (HT on), на 24 CPU те же ~342k / ~58k. Поэтому используем **16-vCPU edge-ноды** напрямую: с 50% production-headroom получаем 170k HTTPS RPS и 28k TLS CPS sustainable per node.
+
+SSE-лимит бенчмарк [^13] не покрывал — он гоняет короткие request-response через `wrk`. Для долгоживущих SSE-стримов реальный потолок — RAM и file descriptors: TLS-state + connection buffers ≈ 60 КБ/conn × 100k ≈ 6 ГБ RAM, что комфортно для 32 ГБ ноды.
 
 Глобальные значения раскладываем по регионам пропорционально доле HTTP-трафика из §3.3 (17.5 / 17.5 / 35 / 30%):
 
-$$N_{min} = \max\left(\left\lceil \tfrac{\text{Peak RPS}}{56\,000} \right\rceil, \left\lceil \tfrac{\text{Peak CPS}}{6\,600} \right\rceil, \left\lceil \tfrac{\text{Peak Gbit/s}}{17.6} \right\rceil\right); \qquad N_{total} = 2 \times N_{min}$$
+$$N_{min} = \max\left(\left\lceil \tfrac{\text{Peak RPS}}{170\,000} \right\rceil, \left\lceil \tfrac{\text{Peak CPS}}{28\,000} \right\rceil, \left\lceil \tfrac{\text{Peak Gbit/s}}{22} \right\rceil, \left\lceil \tfrac{\text{Peak SSE}}{100\,000} \right\rceil\right); \qquad N_{total} = 2 \times N_{min}$$
 
-| Регион  | Peak RPS | Peak CPS | Peak Gbit/s | $N_{rps}$ | $N_{cps}$ | $N_{net}$ | $N_{min}$ | **$N_{total}$ (2N)** |
-| ------- | -------: | -------: | ----------: | --------: | --------: | --------: | --------: | -------------------: |
-| US East |  29 769  |   8 931  |    4.39     |     1     |     2     |     1     |     2     |              **4**   |
-| US West |  29 769  |   8 931  |    4.39     |     1     |     2     |     1     |     2     |              **4**   |
-| EU      |  59 538  |  17 861  |    8.79     |     2     |     3     |     1     |     3     |              **6**   |
-| APAC    |  51 032  |  15 310  |    7.53     |     1     |     3     |     1     |     3     |              **6**   |
+| Регион  | Peak RPS | Peak CPS | Peak Gbit/s | Peak SSE | $N_{rps}$ | $N_{cps}$ | $N_{net}$ | $N_{sse}$ | $N_{min}$ | **$N_{total}$ (2N)** |
+| ------- | -------: | -------: | ----------: | -------: | --------: | --------: | --------: | --------: | --------: | -------------------: |
+| US East |  29 769  |   8 931  |    4.39     |  210 648 |     1     |     1     |     1     |     3     |     3     |              **6**   |
+| US West |  29 769  |   8 931  |    4.39     |  210 648 |     1     |     1     |     1     |     3     |     3     |              **6**   |
+| EU      |  59 538  |  17 861  |    8.79     |  421 295 |     1     |     1     |     1     |     5     |     5     |             **10**   |
+| APAC    |  51 032  |  15 310  |    7.53     |  361 110 |     1     |     1     |     1     |     4     |     4     |              **8**   |
 
-**Итого 20 L7-балансировщиков** (ingress-nginx) на 4 ДЦ. Узким местом везде оказывается TLS CPS — ожидаемый профиль для HTTPS-сервиса с долей новых соединений 30%. Одновременных SSE-соединений на реплику (~52–70 тыс.) — запас 4–5× от паспортных 300 тыс.: упираемся не в file-descriptor-ы, а в CPU на TLS handshake.
+**Итого 30 L7-балансировщиков** (ingress-nginx) на 4 ДЦ. Узким местом во всех регионах оказывается **concurrent SSE** — это характерный профиль AI-чата: стримы держатся 5–60 сек, поэтому одна нода с производительностью 170k RPS «недогружена» по CPU, но забита открытыми соединениями. RPS, CPS и NIC под такой нагрузкой расходуются на считанные единицы, в каждом регионе остаётся 5–10× запас.
 
 ## 4.4 Резервирование и реакция на отказы
 
@@ -867,8 +873,8 @@ API-клиенты тиров не имеют (pay-as-you-go); их монети
 | Строк | ~5 млрд/день, ~1.83 трлн/год (1 inference-цикл Web = 2 строки: `role=user` + `role=assistant`; API stateless, не пишет) |
 | Размер строки | ~1.7 KB (avg: 1.2 KB user + 2 KB assistant + ~100 B метаданных, см. §2.2; физический overhead — §6.5) |
 | Общий объём | ~8.5 TB/день, ~3.1 PB/год (логический; физически ×RF, см. §6.5) |
-| QPS чтение | 12 500 avg / 25 000 peak (загрузка диалога при открытии) + редкие точечные `WHERE request_id=?` (audit, support) |
-| QPS запись | 57 870 avg / 115 740 peak (Web inference avg 28 935 × 2 messages) |
+| QPS чтение | **41 435 avg / 82 870 peak** = 12 500/25 000 открытие диалога + 28 935/57 870 чтение контекста перед каждым inference. Плюс редкие точечные `WHERE request_id=?` (audit, support) |
+| QPS запись | 57 870 avg / 115 740 peak Web inference avg 28 935 × 2 messages (user + assistant) |
 | Консистентность | Eventual (read-after-write delay допустим: пользователь видит свой prompt и ответ из памяти стрима до фиксации) |
 | Распределение ключей | Hot-partitions у активных диалогов; внутри партиции — равномерно по `created_at`. Подробно — §5.4 |
 
@@ -891,7 +897,7 @@ API-клиенты тиров не имеют (pay-as-you-go); их монети
 | Строк | ~100 млн |
 | Размер строки | ~170 B |
 | Общий объём | ~17 GB |
-| QPS чтение | 8 680 peak (валидация на каждом API-запросе; Web-трафик идёт через sessions) |
+| QPS чтение | 39 063 avg / 78 125 peak (валидация на каждом API-запросе = API peak inference RPS, см. §2.2; в PG бьёт только cache miss — кеш `apikey:{key_hash}` в Redis, §6.8) |
 | QPS запись | ~100 (только создание ключа) |
 | Консистентность | Strong |
 | Распределение ключей | Равномерное по key_hash |
@@ -1055,10 +1061,11 @@ Append-only журнал значимых действий пользовате�
 | Строк | ~2 млрд (верхняя оценка с буфером; реалистично ~600M активных в моменте: 540M `msg_day` + 75M `msg_3h` + 5M `rps` + 10M API; буфер ×3 на пики и неравномерность нагрузки) |
 | Размер строки | ~50 B логически; ~100 B физически с overhead in-memory KV (см. §6.8) |
 | Общий объём | ~100 GB (in-memory, per-region) |
-| QPS чтение | ~250 000 peak (Web: ~3 счётчика на inference + 1 на остальной HTTP; API: 2 счётчика на запрос) |
-| QPS запись | ~250 000 peak (атомарный check-and-incr) |
+| QPS чтение | ~170 000 peak (1 атомарный Lua-`check_and_incr` на каждый внешний HTTP-запрос; для inference это сразу несколько счётчиков под одним hash-tag, считается как одна Redis-операция) |
+| QPS запись | ~170 000 peak (тот же Lua-скрипт инкрементит счётчики атомарно) |
 | Консистентность | Strong (per-region); cross-region не реплицируется — пользователь привязан к региону Anycast (§3) |
 | TTL | 60 сек / 3 часа / 24 часа (по окну счётчика) |
+| Оптимизация (опц.) | На горячем пути можно агрегировать инкременты локально в pod-е (token-bucket в RAM) и sync'ить в Redis раз в 1–5 сек — снижает QPS в 5–10× ценой допустимого overshoot до длительности окна агрегации |
 
 ---
 
@@ -1105,10 +1112,10 @@ Append-only журнал значимых действий пользовате�
 | web_tier_quotas | ~40 | 40 B | < 2 КБ | ~10 (миссы кеша) | < 0.1 | Strong |
 | users | 1 млрд | 200 B | 200 GB | 4 200 | 100 | Strong |
 | conversations | 366 млрд | 140 B | 51 TB | 16 670 / 33 340 peak | 40 600 / 81 300 peak (11 700 create + 28 935 update) | Strong (user) |
-| messages | 1.83 трлн/год | 1.7 KB | 3.1 PB/год | 12 500 / 25k peak | 57 870 / 115 740 peak | Eventual |
-| api_keys | 100 млн | 170 B | 17 GB | 8 680 (peak) | 100 | Strong |
+| messages | 1.83 трлн/год | 1.7 KB | 3.1 PB/год | 41 435 / 82 870 peak | 57 870 / 115 740 peak | Eventual |
+| api_keys | 100 млн | 170 B | 17 GB | 39 063 / 78 125 peak | 100 | Strong |
 | sessions | 1 млрд | 96 B | 96 GB | 84 500 / 169k peak | 386 / 772 peak | Strong |
-| rate_limits | ~2 млрд счётчиков (с буфером) | 50 B | ~100 GB | ~250k peak | ~250k peak | Strong (per-region) |
+| rate_limits | ~2 млрд счётчиков (с буфером) | 50 B | ~100 GB | ~170k peak | ~170k peak | Strong (per-region) |
 | billing_accounts | 10 млн | 64 B | 640 MB | 39 063 / 78 125 peak | 78 125 / 156 250 peak | Strong (SERIALIZABLE) |
 | usage_records | 2.14 трлн/год | 116 B | ~243 TB/год | 1 000 | 67 998 / 135 996 peak | Eventual |
 | attachments | 64 млрд/год | 210 B | 13 TB/год метаданные + **~126 ПБ/год бинарники** | 3 750 peak | 8 100 peak (4 050 create + 4 050 status update) | Strong |
@@ -1122,27 +1129,18 @@ Append-only журнал значимых действий пользовате�
 
 Один тип базы данных не покрывает все требования одинаково эффективно. В таблице ниже — назначение каждого контура и причина выбора технологии.
 
-| Контур | Хранилище | Почему выбран именно этот вариант |
+| Контур | Хранилище | Почему |
 | --- | --- | --- |
-| Пользовательские данные (users, conversations, api_keys, attachments_metadata) | PostgreSQL + Citus | PostgreSQL даёт ACID, SQL и зрелую экосистему. Citus добавляет горизонтальное шардирование по distribution column (`user_id`) и co-location связанных таблиц на одном worker-узле — `GET /v1/profile` обслуживается без cross-shard JOIN. |
-| Биллинг (billing_accounts) | PostgreSQL (отдельный кластер) | Резерв и списание средств требуют SERIALIZABLE-транзакций. Централизованный кластер в US East снимает distributed coordination и риск списать одни деньги дважды. |
-| Справочники (subscription_tiers, models) | PostgreSQL reference tables | Маленькие версионируемые таблицы с бизнес-атрибутами (цены, лимиты). Logical replication раздаёт read-only-копию на каждый PG-шард — `JOIN users → subscription_tiers` обслуживается локально. |
-| Журнал событий (audit_log) | PostgreSQL | Append-only с партициями по дате; нужны индексы `(user_id, created_at)` для security-расследований. Объём <10 ТБ — PG справляется без OLAP-движка. |
-| Чат-сообщения (messages) | ScyllaDB | Запись-доминанта (write-heavy) 58k RPS на PB-объём. Wide-column модель (строка с фиксированным partition key + произвольный набор «clustering»-столбцов, упорядоченных внутри партиции; ниже в §6.5 — конкретные ключи `conv_id` + `(created_at, message_id)`) идеально ложится на партицию `conv_id` — все сообщения диалога на одной ноде. Eventual consistency (запись считается успешной до полной репликации; короткое окно, когда разные ноды могут вернуть разные версии данных) допустима для чата. |
-| Сессии и rate-limit | Redis Cluster | Низкая задержка на каждом HTTP-запросе (auth ~95k RPS, rate-limit ~173k RPS), TTL из коробки, атомарные операции на Lua-скриптах для проверки-и-инкремента (check-and-incr — одной командой прочитать текущее значение, сравнить с лимитом и атомарно инкрементить; без скрипта это два round-trip и race condition). Распределение по 16 384 hash slots (Redis Cluster делит ключевое пространство на фиксированные слоты, каждый слот закреплён за master-нодой) даёт линейное горизонтальное масштабирование. |
-| Биллинг-аналитика (usage_records) | ClickHouse | Только вставка (append-only), ~243 ТБ/год, аналитические агрегации по большим объёмам. Семейство `MergeTree` (колоночный движок CH с сортированными частями данных), партиционирование по `toYYYYMM` и тип `LowCardinality(String)` для столбца `channel` (CH хранит словарь уникальных значений и заменяет строки на int-коды) дают ×10 сжатие кодеком LZ4 и доли секунды на агрегации. |
-| Объектное хранилище (attachments blob) | Ceph Object Gateway (RGW) | S3-совместимый API поверх собственного Ceph-кластера, масштабируется добавлением OSD-узлов, поддерживает multisite-репликацию. На 126 ПБ/год self-hosted решение согласовано с on-prem архитектурой (свои ДЦ, GPU, BGP) и кратно дешевле managed AWS S3 по storage и egress. |
+| Пользовательские данные (users, conversations, api_keys, attachments) | PostgreSQL + Citus | ACID, SQL, шардирование по distribution column `user_id` и co-location связанных таблиц на одном worker — `GET /v1/profile` обслуживается без cross-shard JOIN |
+| Биллинг (billing_accounts) | PostgreSQL (отдельный кластер) | Резерв/списание требуют SERIALIZABLE-транзакций; централизованный кластер в US East снимает distributed coordination и изолирует failure domain от пользовательского кластера |
+| Справочники (subscription_tiers, models, web_tier_quotas) | PostgreSQL reference tables | Версионируемые таблицы с бизнес-атрибутами; logical replication раздаёт копию на каждый PG-шард — `JOIN users → subscription_tiers` без cross-shard hop |
+| Журнал событий (audit_log) | PostgreSQL | Точечные lookup `(user_id, created_at)` для security-расследований — OLTP-паттерн, не аналитика. Объём <10 ТБ — PG партиции по дате справляются |
+| Чат-сообщения (messages) | ScyllaDB | Реляционная БД (PG/Citus) на 3+ ПБ / 116k peak write / 83k peak partition-read диалога не масштабируется: (а) read диалога — это `WHERE conv_id=? ORDER BY created_at LIMIT N`, при шардировании по `user_id` это локальная partition-операция, но vacuum/autovacuum на write-heavy таблице вызывает latency spikes; при шардировании по `conv_id` ломается co-location с users; (б) sustained 116k write RPS на одну PG-таблицу упирается в WAL-checkpoint pauses и bloat. ScyllaDB: LSM-tree write-path без WAL-checkpoint pauses, partition-read диалога одной операцией ≤10 мс на любом объёме, линейное масштабирование добавлением нод |
+| Сессии, кеш API-ключей и rate-limit | Redis Cluster | Низкая задержка на каждом HTTP (auth ~169k peak, apikey ~78k peak, rate-limit ~170k peak QPS), TTL, атомарные Lua-скрипты для check-and-incr, 16 384 hash slots для горизонтального масштабирования |
+| Биллинг-аналитика (usage_records) | ClickHouse | Append-only ~243 ТБ/год, OLAP-агрегации по большим объёмам; MergeTree + партиции `toYYYYMM` + `LowCardinality(String)` дают ×10 сжатие LZ4 и доли секунды на агрегации |
+| Объектное хранилище (attachments blob) | Ceph Object Gateway (RGW) | S3-совместимый API, self-hosted, multisite-репликация; на 126 ПБ/год кратно дешевле managed cloud по storage и egress |
 
-MinIO как основное blob-хранилище не выбран: репозиторий `minio/minio` в начале 2026 года переведён в read-only — это операционный риск. Garage — лёгкая альтернатива для small/medium; для десятков ПБ выбран Ceph RGW как индустриальный стандарт с зрелой multisite-репликацией.
-
-Kafka в архитектуре не используется: единственный получатель аналитики — ClickHouse, который сам батчит входящие записи через `async insert` (буферизация на стороне сервера CH с групповым flush); биллинг синхронный и идёт напрямую в PG. Появятся независимые получатели одного потока событий — Kafka добавится как разветвитель (один producer, несколько consumer-ов через consumer-groups), сейчас это лишнее.
-
-ENUM vs справочник — решается по правилу «есть ли у значения бизнес-атрибуты»:
-
-| Поле | Решение | Почему |
-| --- | --- | --- |
-| `users.tier_id`, `messages.model_id`, `usage_records.model_id` | Справочник (PG) | Есть атрибуты (цены, лимиты, max_context); версионируем при изменениях |
-| `messages.role`, `attachments.status`, `usage_records.channel`, `messages.finish_reason`, `audit_log.event_type` | ENUM / VARCHAR / `LowCardinality` | Нет бизнес-атрибутов; в Scylla JOIN недоступен, в CH `LowCardinality` — это уже «словарь под капотом» |
+Wide-column: row с фиксированным `partition key` (определяет ноду) + набор clustering-столбцов с локальной сортировкой внутри партиции. Eventual consistency для `messages`: запись подтверждена до полной репликации; короткое окно расхождения версий допустимо для чата.
 
 ---
 
@@ -1154,13 +1152,14 @@ ENUM vs справочник — решается по правилу «есть
 | --- | --- | --- | --- | --- |
 | `subscription_tiers` | PostgreSQL reference table | не шардится; полная копия на каждом worker | logical replication во все шарды | master US East → все ДЦ |
 | `models` | PostgreSQL reference table | не шардится; полная копия на каждом worker | logical replication во все шарды | master US East → все ДЦ |
+| `web_tier_quotas` | PostgreSQL reference table | не шардится; полная копия на каждом worker | logical replication во все шарды | master US East → все ДЦ |
 | `users` | PostgreSQL + Citus | `hash(user_id) % 64` | 1 primary + 1 sync + 1 async replica | US East + US West |
 | `conversations` | PostgreSQL + Citus | `hash(user_id)` (colocated с `users`) | colocated с `users` | US East + US West |
 | `api_keys` | PostgreSQL + Citus | `hash(user_id)` (colocated с `users`) | colocated с `users` | US East + US West |
 | `attachments` (метаданные) | PostgreSQL + Citus | `hash(user_id)` (colocated с `users`) | colocated с `users` | US East + US West |
 | `billing_accounts` | PostgreSQL (отдельный кластер) | `hash(user_id) % 32` | 1 primary + 1 sync replica (same AZ) + 1 async replica (US West) | US East only |
 | `audit_log` | PostgreSQL | `PARTITION BY toYYYYMMDD(created_at)` + `hash(user_id) % 16` | 1 primary + 1 async replica | US East only |
-| `messages` | ScyllaDB | partition `conv_id` (Murmur3), clustering `(created_at DESC, message_id)` | multi-DC: RF=3 в US, RF=1 в EU, RF=1 в APAC; total RF=5 | все 4 ДЦ |
+| `messages` | ScyllaDB | partition `conv_id` (Murmur3), clustering `(created_at DESC, message_id)` | multi-DC: RF=3 в каждом DC; total RF=12 (LOCAL_QUORUM=2 устойчив к отказу 1 ноды) | все 4 ДЦ |
 | `usage_records` | ClickHouse | `hash(user_id) % 8`, `PARTITION BY toYYYYMM(created_at)` | ReplicatedMergeTree, 2 реплики на shard | US East only |
 | `sessions` | Redis Cluster | 16 384 hash slots по `sess:{token_hash}` | 1 master + 1 replica на slot | per-region (×4) |
 | `rate_limits` | Redis Cluster | 16 384 hash slots по `{user_id}` (hash-tag для co-location всех счётчиков юзера) | 1 master + 1 replica на slot | per-region (×4) |
@@ -1195,6 +1194,12 @@ erDiagram
         TIMESTAMP effective_from
         TIMESTAMP effective_to
     }
+    web_tier_quotas {
+        UUID tier_id PK "global, logical replication"
+        UUID model_id PK
+        INT messages_per_3h
+        INT messages_per_day
+    }
     users {
         UUID user_id PK "shard: hash(user_id) % 64"
         VARCHAR email UK "IDX: B-tree UNIQUE"
@@ -1226,10 +1231,12 @@ erDiagram
         DECIMAL reserved
     }
     subscription_tiers ||--o{ users : ""
+    subscription_tiers ||--o{ web_tier_quotas : ""
+    models ||--o{ web_tier_quotas : ""
     users ||--o{ conversations : ""
     users ||--o{ api_keys : ""
     users ||--o{ attachments : ""
-    users ||--|| billing_accounts : ""
+    users ||--o| billing_accounts : ""
 ```
 
 ### ScyllaDB
@@ -1279,6 +1286,7 @@ erDiagram
 graph LR
     subgraph Redis["Redis Cluster (per region)"]
         S["sessions<br/>Key: sess:{token_hash}<br/>TTL: 24h"]
+        AK["apikey_cache<br/>Key: apikey:{key_hash}<br/>TTL: 5min"]
         R["rate_limits (Web)<br/>rl:web:rps:{user_id} (60s)<br/>rl:web:msg_3h:{user_id}:{model_id} (3h)<br/>rl:web:msg_day:{user_id}:{model_id} (24h)"]
         RA["rate_limits (API)<br/>rl:api:rpm:{key_id} (60s)<br/>rl:api:tpm:{key_id} (60s)"]
         T["tier_cache<br/>Key: tier:{tier_id}<br/>Hash, TTL: 300s"]
@@ -1309,8 +1317,6 @@ SELECT create_distributed_table('attachments',   'user_id', colocate_with => 'us
 2. co-location позволяет JOIN-ить colocated-таблицы локально на одном worker;
 3. `user_id` (UUID) имеет высокую кардинальность — равномерное распределение.
 
-Риск «горячего пользователя» (один аккаунт с тысячами чатов и вложений) ограничен продуктовыми лимитами (макс. число чатов на user, постраничная выдача, soft-cap по числу api_keys). Для аномально активных B2B-аккаунтов возможен tenant-shard.
-
 ### 6.4.2 Биллинг
 
 `billing_accounts` живёт в **отдельном** PG-кластере, шардируется по `user_id % 32`, но не co-located с пользовательским кластером.
@@ -1322,14 +1328,15 @@ SELECT create_distributed_table('attachments',   'user_id', colocate_with => 'us
 
 ### 6.4.3 Справочники
 
-`subscription_tiers` и `models` — версионируемые reference tables. Полная копия раздаётся на каждый PG-шард через logical replication (лаг < 1 сек):
+`subscription_tiers`, `models` и `web_tier_quotas` — версионируемые reference tables. Полная копия раздаётся на каждый PG-шард через logical replication (лаг < 1 сек):
 
 ```sql
 SELECT create_reference_table('subscription_tiers');
 SELECT create_reference_table('models');
+SELECT create_reference_table('web_tier_quotas');
 ```
 
-При изменении цены или лимита: INSERT новой строки с новым UUID + UPDATE старой `effective_to = NOW()`. Старые `usage_records`, ссылающиеся на старый `tier_id` / `model_id`, продолжают видеть исторические значения — аналитика по выручке стабильна.
+При изменении цены или контекста: INSERT новой строки с новым UUID + UPDATE старой `effective_to = NOW()`. Старые `usage_records.model_id` и `messages.model_id` продолжают ссылаться на исторические версии — аналитика по выручке и UI-ярлычок «дано моделью X» стабильны при изменениях прайс-листа.
 
 ### 6.4.4 Количество шардов
 
@@ -1363,7 +1370,21 @@ CREATE TABLE messages (
 
 `DESC` оптимизирует «последние N сообщений» (самые свежие читаются с начала SSTable — отсортированного immutable файла на диске, в котором Scylla хранит данные); `message_id` — дополнительный ключ упорядочивания (tiebreaker) на случай двух вставок с одинаковым `created_at`.
 
-**Multi-DC keyspace** (keyspace в Scylla = namespace для таблиц с настройками репликации, multi-DC keyspace = разный RF в разных ДЦ): RF=3 в US East+West (с уровнем согласованности `LOCAL_QUORUM` — операция подтверждена ⌈3/2⌉+1=2 нодами из 3 в локальном ДЦ, без ожидания межконтинентального ответа) + RF=1 в EU + RF=1 в APAC, итого RF=5. Локальное чтение в EU/APAC даёт быстрый отклик пользователю (открытие диалога без round-trip в US); сторонним эффектом приходит storage cost ×1.7 (3.1 ПБ × 1.7 = 5.3 ПБ effective per year).
+**Multi-DC keyspace** (keyspace в Scylla = namespace для таблиц с настройками репликации, multi-DC keyspace = разный RF в разных ДЦ) через `NetworkTopologyStrategy`:
+
+```cql
+CREATE KEYSPACE chat WITH replication = {
+    'class': 'NetworkTopologyStrategy',
+    'us_east': 3,
+    'us_west': 3,
+    'eu_central': 3,
+    'apac': 3
+};  -- total RF = 12
+```
+
+Чтение/запись с `LOCAL_QUORUM` (кворум в локальном ДЦ — ⌈RF_local/2⌉+1 нод, без межконтинентального round-trip). RF=3 в каждом DC — production-минимум: LOCAL_QUORUM = 2 устойчив к отказу одной локальной ноды без cross-DC fallback (RF=1 или RF=2 не дают этого: при потере ноды read падает либо в недоступность, либо в `ALL`-strong-consistency = отказ).
+
+Storage cost: 3.1 ПБ логических × RF=12 = **37 ПБ effective per year** (+ ~10% overhead на Bloom-фильтры и индексы).
 
 **Materialized View** (материализованное представление — Scylla автоматически поддерживает вторую копию таблицы с другим partition key, синхронизация — асинхронная за каждой записью) `messages_by_request` использует `request_id` как partition key. Это даёт O(1)-lookup «найти оба сообщения цикла по `request_id`» (audit, support, GDPR) ценой ×1.05 storage и +1 write per insert. Горячий путь по `conv_id` не затрагивается. Альтернатива — Secondary Index — реализована через scatter-gather по всем нодам, latency нестабильна на PB-объёмах.
 
@@ -1371,13 +1392,17 @@ CREATE TABLE messages (
 
 ### Количество нод
 
+Реалистичная Scylla-нода: 24 × 4 TB NVMe = 96 TB raw → ~60 TB usable (запас 30% на TWCS-compaction + 10% Bloom/index overhead).
+
 | Регион | RF | Объём данных (year 1) | Нод |
 | --- | --- | --- | --- |
-| US East | 3 | 9.3 ПБ (3.1 × 3) | 6 |
-| US West | 3 | 9.3 ПБ | 6 |
-| EU Central | 1 | 3.1 ПБ | 6 |
-| APAC | 1 | 3.1 ПБ | 6 |
-| **Итого** | | | **24** |
+| US East | 3 | 9.3 ПБ | 155 |
+| US West | 3 | 9.3 ПБ | 155 |
+| EU Central | 3 | 9.3 ПБ | 155 |
+| APAC | 3 | 9.3 ПБ | 155 |
+| **Итого** | RF=12 | ~37 ПБ effective | **~620** |
+
+TWCS (Time-Window Compaction Strategy — оптимизация для time-series workload) даёт атомарное удаление старых SSTable по окну; TTL для `messages` в MVP не задан, но архитектура готова к hot/cold-политике (Phase 2 — выселять холодные SSTable старше 90 дней в Ceph RGW, что сократит парк Scylla в ~10 раз). Точные конфигурации — §11.
 
 ---
 
@@ -1406,7 +1431,7 @@ ALTER TABLE usage_records ADD INDEX request_id_bloom request_id TYPE bloom_filte
 
 Партиции по месяцу: горячие данные за 3 месяца на NVMe, постарше — на HDD, после 1 года — drop партиции. Skipping-индекс типа `bloom_filter` (для каждого блока в 8192 строки CH строит компактный bitmap, по которому быстро отбрасывает блоки, где точно нет искомого значения — экономит чтение с диска) по `request_id` обслуживает точечные audit-запросы, не мешая основным агрегациям по `(user_id, created_at)`.
 
-`cost` зафиксирован в момент записи (денормализация, см. §6.10) — ClickHouse не делает JOIN с `models` на горячем пути. Разбивка выручки по моделям — batch-задача через external dictionary (внешний словарь — ClickHouse подгружает справочник из PG в RAM, обновляет каждые 5 мин и использует как локальную lookup-таблицу).
+`cost` зафиксирован в момент записи (денормализация, см. §6.10) — ClickHouse не делает JOIN с `models` на горячем пути. Разбивка выручки по моделям — через external dictionary (подгрузка справочника `models` из PG в RAM ClickHouse с TTL 5 мин).
 
 Кластер централизован в US East (8 shards × 2 replicas = 16 нод). Регионалы льют биллинг через HTTP async insert (терпит +150 мс, биллинг — не критичный путь).
 
@@ -1447,7 +1472,8 @@ Redis Cluster в каждом регионе обслуживает 4 патте
 
 | Ключ | Тип | TTL | Назначение |
 | --- | --- | --- | --- |
-| `sess:{token_hash}` | String (JSON) | 24h | Сессия Web-юзера: `{user_id, tier_id, expires_at}` |
+| `sess:{token_hash}` | String (JSON) | 24h | Сессия Web-юзера: `{user_id, tier_id, expires_at}` (`tier_id` денормализован для hot-path rate-limit, см. §6.10) |
+| `apikey:{key_hash}` | String (JSON) | 5 min | Валидация API-ключа на каждом API-запросе: `{key_id, user_id, is_active}`. Без кеша 78 125 peak RPS бьют напрямую в PG `api_keys` |
 | `rl:web:rps:{user_id}` | Counter | 60s | Технический burst-cap (системная константа) |
 | `rl:web:msg_3h:{user_id}:{model_id}` | Counter | 3h | Бизнес-лимит на модель (`web_tier_quotas.messages_per_3h`) |
 | `rl:web:msg_day:{user_id}:{model_id}` | Counter | 24h | Бизнес-лимит на модель (`web_tier_quotas.messages_per_day`) |
@@ -1475,10 +1501,11 @@ Rate Limiter использует атомарный Lua-скрипт `check_and
 | `subscription_tiers` | `(tier_code) WHERE effective_to IS NULL` | Partial B-tree | Найти активную версию тарифа по коду |
 | `models` | PK `model_id` | B-tree | FK target |
 | `models` | `(model_code) WHERE effective_to IS NULL` | Partial B-tree | Найти активную версию модели по коду |
+| `web_tier_quotas` | PK `(tier_id, model_id)` | B-tree | Lookup лимитов по тарифу и модели (горячий путь rate-limit) |
 | `users` | UNIQUE `email` | B-tree | Login |
 | `users` | `(tier_id)` | B-tree | Аналитика «сколько юзеров на каждом тарифе» |
 | `conversations` | `(user_id, updated_at DESC)` | B-tree | Список чатов с сортировкой |
-| `api_keys` | `key_hash` | B-tree | Валидация API-ключа на каждый запрос |
+| `api_keys` | UNIQUE `key_hash` | B-tree | Валидация API-ключа на каждый запрос |
 | `billing_accounts` | `(balance) WHERE balance < threshold` | Partial B-tree | Проактивные уведомления о низком балансе |
 | `attachments` | `(message_id)`, `(request_id)`, `(user_id, created_at DESC)` | B-tree | Список вложений сообщения, audit-lookup по request_id, квоты юзера |
 | `audit_log` | `(user_id, created_at DESC)` per partition | B-tree | Security investigation |
@@ -1498,39 +1525,44 @@ Rate Limiter использует атомарный Lua-скрипт `check_and
 | `messages.tokens_count` | Scylla | Без повторного tokenize при чтении |
 | `messages.model_id` (только для `role=assistant`) | Scylla | UI-ярлычок «дано моделью X» одним lookup в `model_cache`, без JOIN с `usage_records` через `request_id` |
 | `usage_records.cost` | ClickHouse | Цена per-token зафиксирована в момент записи; CH не делает JOIN с прайс-листом в hot-path |
-| Reference tables `subscription_tiers` / `models` на каждом PG-шарде | PG | Локальный JOIN `users → subscription_tiers` без cross-shard hop; overhead ~12 КБ на шард |
+| `sess:{token_hash}.tier_id` | Redis | Авторизация и rate-limit за один lookup, без второго запроса `users.tier_id`; обновляется через pub/sub `cache:invalidate` при смене тарифа |
+| Reference tables `subscription_tiers` / `models` / `web_tier_quotas` на каждом PG-шарде | PG | Локальный JOIN `users → subscription_tiers` без cross-shard hop; overhead < 20 КБ на шард |
 
 ---
 
 ## 6.11 Клиентские библиотеки и пулы подключений
 
+PgBouncer — легковесный пулер соединений для PostgreSQL: приложение коннектится в PgBouncer, PgBouncer держит ограниченный пул живых соединений к PG и переиспользует их между клиентами. Стоит перед каждым PG-кластером в `transaction mode` (соединение возвращается в пул после каждой транзакции — самый плотный режим), лимит 100 соединений на пул. Снимает накладные на open/close TCP на каждом HTTP-запросе.
+
 | СУБД | Клиентская библиотека | Connection pool / proxy | Балансировка |
 | --- | --- | --- | --- |
-| PostgreSQL | asyncpg (Python), pgx (Go) | PgBouncer в transaction mode | Writes → primary, reads → replicas (round-robin) |
-| ScyllaDB | scylla-driver, gocql | Token-aware routing в драйвере | Драйвер сам считает Murmur3-хеш ключа и шлёт запрос сразу на нужную ноду, без посредника-координатора |
+| PostgreSQL | asyncpg (Python), pgx (Go) | PgBouncer (transaction mode) | Writes → primary, reads → replicas (round-robin) |
+| ScyllaDB | scylla-driver, gocql | Token-aware routing в драйвере | Драйвер считает Murmur3-хеш ключа и шлёт запрос сразу на нужную ноду, без координатора |
 | Redis | redis-py, go-redis | Redis Cluster routing (built-in) | Клиент знает hash-slot → master mapping, шлёт команду сразу на нужную ноду |
 | ClickHouse | clickhouse-connect | HTTP-интерфейс с async insert и connection reuse | Distributed-таблица на одной ноде сама шлёт на shards |
 | Ceph RGW | boto3 / aws-sdk-go (S3 API) | HTTP keep-alive | Клиент льёт presigned PUT напрямую в региональный endpoint |
-
-PgBouncer (легковесный пулер соединений для PostgreSQL: приложение коннектится в PgBouncer, PgBouncer держит ограниченный пул живых соединений к PG и переиспользует их между клиентами) стоит перед каждым PG-кластером в режиме `transaction mode` (соединение к PG выдаётся клиенту на одну транзакцию и сразу возвращается в пул — самый плотный режим), лимит 100 соединений на пул. Это снимает накладные на открытие соединения на каждый HTTP-запрос (asyncpg + PgBouncer = ~0.3 мс на acquire).
 
 ---
 
 ## 6.12 Резервное копирование
 
-| Хранилище | Способ | Хранение | RPO | RTO |
-| --- | --- | --- | --- | --- |
-| PostgreSQL (user data) | pg_basebackup (полный снимок кластера) + WAL archiving (Write-Ahead Log — журнал PG со всеми изменениями, сохраняется в Ceph RGW) → восстановление PITR (Point-In-Time Recovery — накатываем WAL поверх базового снимка до нужного момента во времени) | Ceph RGW, 30 дней | < 1 мин | < 15 мин |
-| PostgreSQL (billing_accounts) | pg_basebackup + WAL streaming + sync replica (same AZ) + async replica (US West) | Ceph RGW, 1 год | 0 внутри AZ / ≤5 сек cross-DC | < 5 мин (promote sync-replica) |
-| PostgreSQL (attachments_metadata) | pg_basebackup + WAL archiving | Ceph RGW, 30 дней | < 1 мин | < 15 мин |
-| PostgreSQL (audit_log) | pg_basebackup + WAL + dump старых партиций | Ceph cold-tier, 7 лет (compliance) | < 1 мин | < 30 мин |
-| ScyllaDB | nodetool snapshot, ежедневно | Ceph RGW, 14 дней | < 1 час | < 1 час |
-| ClickHouse | BACKUP TABLE → Ceph RGW, ежедневно | Ceph RGW, 90 дней | < 24 часа | < 1 час |
-| Redis (sessions) | RDB ежечасно + AOF always | Ceph RGW, 7 дней | < 1 сек | < 5 мин |
-| Redis (rate_limits) | не бэкапится | — | TTL 60 сек | моментально (восстанавливается из живого трафика) |
-| Ceph RGW (attachments blob) | Multisite-replication + Object Versioning | EC 8+3 + cold-tier 3 года | < 15 мин | native (RGW failover) |
+Все PG-кластеры используют схему `pg_basebackup` (полный снимок кластера) + WAL archiving (Write-Ahead Log — журнал PG со всеми изменениями), что даёт PITR (Point-In-Time Recovery — восстановление на любой момент времени накатом WAL поверх базового снимка). Бэкапы складываются в Ceph RGW (`llm-backups`).
 
-Кэш Redis и in-flight inference-состояние единственным источником истины не являются: при полной потере sessions создаются заново на логине, rate-limits — из текущего трафика, in-flight inference — клиент ретраит запрос с тем же `request_id`. Для PG WAL-archiving позволяет восстановить кластер до точного момента времени.
+Для **stateful-кластеров с большим объёмом** (ScyllaDB ~37 ПБ, Redis ~100 ГБ на регион) основной механизм отказоустойчивости — **онлайн-репликация** (RF в кластере + кросс-региональные реплики), а **резервное копирование закрывает только catastrophic recovery** (corruption, accidental DROP, ransomware). Поэтому RTO бэкапа на таком объёме измеряется часами, а production-RPO/RTO достигается через failover, не через restore.
+
+| Хранилище | Failover (онлайн) | Backup (catastrophic) | Хранение бэкапа |
+| --- | --- | --- | --- |
+| PostgreSQL (user data) | sync+async replicas; promote ~10 сек | pg_basebackup + WAL archiving (RPO < 1 мин, RTO < 15 мин) | 30 дней |
+| PostgreSQL (billing_accounts) | sync replica (same AZ) + async (US West); promote <5 сек, RPO=0 | pg_basebackup + WAL archiving (RPO < 1 мин, RTO < 15 мин) | 1 год |
+| PostgreSQL (attachments метаданные) | sync+async replicas; promote ~10 сек | pg_basebackup + WAL archiving (RPO < 1 мин, RTO < 15 мин) | 30 дней |
+| PostgreSQL (audit_log) | async replica | pg_basebackup + WAL + dump старых партиций (RPO < 1 мин, RTO < 30 мин) | cold-tier, 7 лет |
+| ScyllaDB | RF=3 в каждом DC; потеря 1 ноды → LOCAL_QUORUM из 2 (RPO=0, RTO=0); потеря целого DC → переключение на соседний DC через клиент-драйвер | `nodetool snapshot` ежедневно, инкрементальный backup (commitlog) каждые 15 мин — для отката от corruption / accidental delete (RPO ≤ 15 мин, RTO 2–6 ч на восстановление одного DC из бэкапа) | 14 дней |
+| ClickHouse | ReplicatedMergeTree 2 реплики | `BACKUP TABLE`, ежедневно (RPO < 24 ч, RTO < 1 ч) | 90 дней |
+| Redis (sessions, apikey_cache) | 1 master + 1 replica на slot; auto-failover Redis Cluster ~5–15 сек, RPO 0 в синхронном режиме | RDB ежечасно + AOF (RPO < 1 ч); RTO для полного restore 100 ГБ — 30–60 мин (загрузка с диска, прогрев). На практике используется failover, не restore | 7 дней |
+| Redis (rate_limits) | replica failover ~5 сек | не бэкапится — TTL 60 сек / 3 ч / 24 ч, восстанавливается из живого трафика | — |
+| Ceph RGW (attachments blob) | EC 8+3 (переживает потерю 3 OSD) + multisite-replication | Object Versioning + replica buckets (RPO < 15 мин cross-region, RTO native через смену endpoint) | cold-tier 3 года |
+
+Кэш Redis и in-flight inference-состояние не являются источником истины: sessions пересоздаются на логине, rate-limits — из текущего трафика, in-flight inference — клиент ретраит с тем же `request_id`.
 
 # Источники
 
@@ -1544,7 +1576,7 @@ PgBouncer (легковесный пулер соединений для Postgre
 
 [^5]: Exploding Topics. *ChatGPT Users Statistics.* https://explodingtopics.com/blog/chatgpt-users
 
-[^6]: OpenAI. *How people are using ChatGPT.* https://openai.com/index/how-people-are-using-chatgpt/
+[^6]: OpenAI. *How people are using ChatGPT.* https://openai.com/index/how-people-are-using-chatgpt/ [Полная версия статьи](https://cdn.openai.com/pdf/a253471f-8260-40c6-a2cc-aa93fe9f142e/economic-research-chatgpt-usage-paper.pdf)
 
 [^7]: LMSYS-Chat-1M dataset (2023)
 
