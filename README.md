@@ -1041,6 +1041,8 @@ Append-only журнал значимых действий пользовате�
 | `(key_id, rpm)` | 60 сек | системная константа | API |
 | `(key_id, tpm)` | 60 сек | системная константа | API |
 
+Web — **RPS** на 60-секундном окне: живой человек делает burst-ы при F5 / regenerate, секундная гранулярность ловит именно этот паттерн. API — **RPM + TPM**: программный клиент шлёт равномерный поток, секунды не нужны; зато tokens-per-minute обязателен, потому что (а) деньги списываются за токены (см. `usage_records.cost`), (б) GPU-нагрузка ∝ tokens (prefill API-запроса с 6k токенов ≈ ×20 cost от Web-запроса с 300 токенов). Один RPM без TPM не защищает: 100 API-запросов/мин × 6k токенов = 600k токенов/мин, что уже сопоставимо с capacity модели.
+
 **Бизнес-лимиты** (только Web; API монетизируется через `usage_records` × `billing_accounts`):
 
 | Счётчик (логический ключ) | Окно | Источник лимита | Канал |
@@ -1564,6 +1566,236 @@ PgBouncer — легковесный пулер соединений для Post
 
 Кэш Redis и in-flight inference-состояние не являются источником истины: sessions пересоздаются на логине, rate-limits — из текущего трафика, in-flight inference — клиент ретраит с тем же `request_id`.
 
+# 7. Алгоритмы
+
+Раздел описывает алгоритмы, способ реализации которых **существенно** влияет на профиль нагрузки, организацию данных или архитектуру компонентов. Стандартные механизмы СУБД (LSM-tree, MergeTree, CRUSH, Murmur3, Erasure Coding) и сетевые протоколы (TLS handshake, HTTP/2, SSE, BGP failover) сюда не входят — они описаны в §3 и §6.
+
+## 7.1 Continuous batching на GPU
+
+**Где применяется:** `gpu-worker` pods в US East / US West (§4.1).
+
+**Задача:** обслужить пиковые 137 996 inference-запросов/сек при autoregressive token-generation так, чтобы парк H100 был минимально возможным, а TTFT ≤ 300 мс.
+
+**Ограничения:** длина output варьируется (Web ~500 ток, API ~400 ток, std large); KV-cache живёт в HBM3 GPU и расходует память пропорционально длине контекста; одна H100 (80 ГБ HBM3) фит ограниченное число параллельных запросов; новые запросы прибывают в течение всего decode-цикла уже идущих.
+
+**Шаги работы:**
+
+1. На каждом decode-step (одна итерация = +1 токен для каждого активного запроса в батче) scheduler GPU-worker-а пересобирает батч.
+2. Запросы, у которых сработал `finish_reason` (`stop` / `length` / `error` — см. `messages.finish_reason` в §5.3), **немедленно** освобождают свои KV-cache blocks и уходят из батча.
+3. Если в очереди есть новые запросы и есть свободные KV-cache blocks — добавляются в батч до следующего step.
+4. KV-cache аллоцируется блоками по `block_size` токенов (PagedAttention [^15]) — память переиспользуется без фрагментации.
+
+**Структуры данных:**
+- KV-cache blocks (~16 токенов/блок, аллоцируются по требованию).
+- Per-worker request queue (FIFO с приоритетом).
+- Page table «logical → physical block» (per-request).
+
+**Альтернативы:**
+- **Static batching** (батч фиксируется при заполнении, обрабатывается до конца самого длинного запроса) — короткие запросы простаивают, ждут самого длинного: GPU idle >50%.
+- **Dynamic batching без continuous** (батч пересобирается между запросами, но не внутри них) — те же простои на разной длине output.
+
+**Обоснование:** vLLM с PagedAttention даёт ×2–24 throughput на той же модели по сравнению с HuggingFace Transformers за счёт continuous batching + почти полной утилизации HBM под KV-cache (96%+) [^15]. Подход формализован в Orca [^16].
+
+**Влияние на архитектуру:**
+- парк H100 сокращается в ~5 раз против static batching при той же SLA.
+- in-flight состояние (KV-cache, очередь, поток токенов) **не персистируется** — живёт в HBM и в открытом SSE-сокете до закрытия стрима. При сбое клиент ретраит с тем же `request_id` (§5.2).
+- scheduler управляет backpressure через 503 / Retry-After на основе queue depth, а не RPS.
+
+## 7.2 Выбор GPU-воркера для запроса (inference scheduling)
+
+**Где применяется:** `inference-scheduler` pods (US East primary, US West warm-standby).
+
+**Задача:** для нового inference-запроса выбрать GPU-воркер так, чтобы минимизировать TTFT и максимизировать переиспользование KV-cache от похожих prompt-ов (общий system-prompt, few-shot, длинная история диалога).
+
+**Ограничения:** ~270+ GPU-воркеров в US (точное число — §11), peak 137 996 запросов/сек, каждый воркер хранит частичный KV-cache от уже обработанных prompt-ов до eviction по LRU.
+
+**Шаги работы — Prefix-aware least-loaded:**
+
+1. На входе scheduler получает префикс промпта (первые K токенов, обычно K=512) и считает по нему стабильный хеш.
+2. Lookup `prefix_hash → worker_id` в Redis (TTL 5 мин).
+3. Если попадание И `worker.queue_depth < threshold`:
+   - Шлём запрос на этот воркер.
+   - Воркер пропускает **prefill** stage для совпадающего prefix-а (KV-cache уже в HBM) → TTFT падает на 30–50% [^17].
+4. Иначе — выбираем worker с минимальным `queue_depth`; обновляем `prefix_hash → worker_id`.
+
+**Структуры данных:**
+- Redis: `prefix:{hash} → worker_id` (TTL 5 мин).
+- Метрики per-worker: queue depth, KV-cache utilization (Prometheus scrape раз в 1 сек).
+
+**Альтернативы:**
+- **Round-robin / Random** — простой, но KV-cache не переиспользуется; TTFT хуже на ~30–50% для запросов с общим системным промптом.
+- **Sticky by `user_id`** — помогает только в рамках одного диалога, не использует переиспользование между юзерами с одинаковым system prompt.
+- **Consistent hashing по `conv_id`** — теряет least-loaded свойство при skew нагрузки.
+
+**Обоснование:** prefix-aware routing — стандартный приём в production-серверах LLM (SGLang [^17], vLLM prefix caching). Для AI-чата с типовыми system-prompt и многоraund-диалогами 40–70% запросов имеют значимый shared prefix.
+
+**Влияние на архитектуру:**
+- §4: `inference-scheduler` — отдельный Deployment с HPA, queue depth публикуется через Prometheus.
+- §6.8: дополнительный паттерн в Redis (`prefix:{hash}`).
+- §3.6: scheduler централизован в US (US East primary), EU/APAC `regional-inference` шлёт ему gRPC.
+
+## 7.3 Сборка контекста Web-инференса из ScyllaDB
+
+**Где применяется:** `chat` pods (§4.1).
+
+**Задача:** на каждый Web inference-запрос собрать историю диалога из БД и сформировать массив `messages[]` для GPU (system + история + новый user-msg) длиной ≤ `context_limit` модели.
+
+**Ограничения:** 28 935 / 57 870 peak Web inference RPS (§2.2); средний контекст ~1 150 токенов / ~4.5 КБ (WildChat [^8]); ScyllaDB partition по `conv_id` (§6.5); цель — latency этапа сборки ≤ 20 мс.
+
+**Шаги работы:**
+
+1. Single-partition read: `SELECT message_id, role, content, tokens_count, created_at FROM messages WHERE conv_id=? ORDER BY created_at DESC LIMIT 50`.
+2. Идём по результату от свежего к старому, накапливаем `Σ tokens_count`, пока сумма + reserve под output < `models.max_context - safety_margin`.
+3. Срезаем массив на точке overflow, переворачиваем хронологически.
+4. Получаем итоговое `messages[]` = `[system_prompt, m_k, m_{k+1}, ..., user_new]`, шлём на GPU.
+
+**Структуры данных:**
+- ScyllaDB partition (`conv_id` → clustering `(created_at DESC, message_id)`) — все сообщения диалога физически на одной ноде.
+- Денормализованное поле `messages.tokens_count` (§6.10) — trim делается без повторного tokenize.
+
+**Альтернативы:**
+- **Кешировать собранный контекст в Redis** — Web DAU 360 млн × ~7 разных диалогов/день — cache miss rate 90%+, кеш не окупается.
+- **Хранить tokenized context в Ceph RGW** — overhead на каждый запрос (HTTP в RGW), latency хуже single-partition read из Scylla.
+- **RAG / vector DB для отбора релевантных messages** — оправдано для длинных историй (1000+ turns); средний chat — 2.5 turns (WildChat [^8]), линейная история эффективнее.
+- **Шардирование `messages` по `user_id`** — теряем locality сообщений одного диалога, scatter-gather на читателе.
+
+**Обоснование:** ScyllaDB partition read укладывается в ≤10 мс на любом объёме (§6.5); денормализованный `tokens_count` снимает повторный tokenize. Это минимально возможный путь по latency для линейной истории.
+
+**Влияние на архитектуру:**
+- §5.3 `messages.QPS чтение`: 28 935 / 57 870 peak — ровно это и есть «1 partition read на 1 Web inference».
+- §6.5: выбор partition key `conv_id` обоснован именно этим алгоритмом.
+- §6.10: `tokens_count` — обязательная денормализация (без неё этап trim требовал бы tokenize всего prompt-а).
+
+## 7.4 Rate limiting: атомарный Lua с co-location через hash-tag
+
+**Где применяется:** `api-gateway` / `chat` middleware + Redis Cluster (§6.8).
+
+**Задача:** на каждом внешнем запросе проверить N счётчиков (Web: 3, API: 2) и атомарно их инкрементнуть; результат — `ALLOW` / `DENY` (HTTP 429) за один RTT под пиком 170 000 op/s.
+
+**Ограничения:** Redis Cluster 16 384 hash slots; multi-key команды разрешены только если все ключи в одном slot; race conditions недопустимы (юзер может уйти за лимит на ~1 RPS).
+
+**Шаги работы:**
+
+1. Все счётчики одного юзера/ключа кладутся под общим **hash-tag** в `{}`:
+   - Web: `rl:web:rps:{user_id}`, `rl:web:msg_3h:{user_id}:{model_id}`, `rl:web:msg_day:{user_id}:{model_id}` — `{user_id}` гарантирует один slot.
+   - API: `rl:api:rpm:{key_id}`, `rl:api:tpm:{key_id}` — co-located по `{key_id}`.
+2. Middleware шлёт **один** `EVALSHA` (cached Lua-script `check_and_incr`) с этими ключами.
+3. Внутри Lua (atomic, без преэмпции):
+   - `HMGET` лимитов из `quota:{tier_id}:{model_id}` (или системных констант для API).
+   - `GET` текущих значений счётчиков.
+   - Если хоть один счётчик ≥ лимита → `return {0, reason}` (DENY).
+   - Иначе `INCR` каждого + `EXPIRE` если ключ новый → `return {1}`.
+
+**Структуры данных:**
+- Redis counters (INT64), TTL = окно счётчика (60 с / 3 ч / 24 ч).
+- Redis hash `quota:{tier_id}:{model_id}` (TTL 300 с, read-through из PG `web_tier_quotas`).
+- Один кешированный SHA-скрипт `check_and_incr`.
+
+**Альтернативы:**
+- **Несколько MULTI/EXEC + WATCH** — retry под contention, в 5–10× медленнее на пике.
+- **Application-side locking** — не масштабируется по нодам приложения.
+- **Token-bucket в локальном RAM каждого pod-а** — описан как Phase 2 оптимизация в §5.3 (rate_limits): снижает Redis QPS в 5–10× ценой overshoot до окна агрегации.
+- **DynamoDB-стиле conditional updates** — не подходит: нужен мульти-ключевой atomic check.
+
+**Обоснование:** hash-tag → один slot → одна Redis-нода → Lua-script атомарен и идёт за один RTT. Это самая дешёвая возможная реализация мульти-счётчикового rate-limit.
+
+**Влияние на архитектуру:**
+- §5.3 / §6.8: ключи и счётчики rate-limit структурированы под hash-tag.
+- §6.8: cluster routing — token-aware client делает один hop по slot, без `MOVED` redirects.
+
+# 8. Технологии
+
+### Backend и сетевой слой
+
+| Технология | Область применения | Почему |
+| --- | --- | --- |
+| Go | `api-gateway`, `chat`, `files`, `regional-inference`, `inference-scheduler` | Высокий RPS, дешёвая многопоточность через goroutines, низкое потребление RAM на горячем пути SSE-стримов |
+| gRPC + Protocol Buffers | Межсервисное взаимодействие (`chat → regional-inference → inference-scheduler → gpu-worker`) | Server-streaming для токенов, бинарный формат, нативный flow control HTTP/2 (backpressure) |
+| SSE (Server-Sent Events) | `chat / api-gateway → клиент` | Однонаправленный стрим токенов поверх HTTP; не требует WebSocket-state, лучше работает через корп. прокси |
+
+### Балансировка и роутинг
+
+| Технология | Область применения | Почему |
+| --- | --- | --- |
+| BIRD2 / FRRouting | BGP-демон на edge-роутерах, Anycast-анонс `/24` (§3.4) | Open-source стандарт для BGP в дата-центрах; CLI `birdc` для управления withdraw / prepend |
+| MetalLB | L4 в k8s, ECMP-распределение Anycast-пакетов по edge-нодам (§4.1) | Нативная интеграция с k8s `Service: LoadBalancer`, BGP-mode даёт корректное распределение без NAT-bottleneck |
+| ingress-nginx | L7: TLS termination, маршрутизация по `Host`, SSE-passthrough (§4.1) | Бенчмарк-материал в требованиях [^13]; нативная поддержка SSE через `proxy_buffering off`, аннотации для sticky / `proxy_next_upstream` |
+
+### Базы данных и хранилища
+
+| Технология | Область применения | Почему |
+| --- | --- | --- |
+| PostgreSQL 16 | `users`, `conversations`, `api_keys`, `attachments` (метаданные), `subscription_tiers`, `models`, `web_tier_quotas`, `audit_log` | ACID, SQL, partial-индексы, JSON-payload в `audit_log`; стандарт для OLTP |
+| Citus | Шардирование PG по `user_id`, co-location, reference tables (§6.4) | Расширение PG (не отдельная БД), даёт горизонтальное масштабирование без смены драйверов и SQL-диалекта |
+| Patroni + etcd | HA-оркестрация PostgreSQL: автоматический failover, управление ролями primary/replica | Стандарт для production PG; etcd хранит leader-state, переключение за ~10 сек |
+| PgBouncer | Connection pool перед PG (transaction mode) | Снимает накладные на TCP open/close; 100 соединений в пул обслуживают тысячи клиентских коннектов |
+| ScyllaDB | `messages` (3.1 ПБ/год), partition по `conv_id` (§6.5) | Wide-column, LSM-tree write-path без WAL-checkpoint pauses, multi-DC `NetworkTopologyStrategy`, partition-read диалога ≤ 10 мс на PB-объёме |
+| ClickHouse | `usage_records` (~243 ТБ/год), OLAP-агрегации (§6.6) | MergeTree + `LowCardinality` + LZ4 = ×10 сжатие; партиции по `toYYYYMM` для drop-по-времени; async-insert батчем |
+| Redis Cluster 7 | Sessions, apikey-cache, rate-limit counters, reference-кеш (§6.8) | Низкая latency (<1 мс), TTL, Lua-script atomicity, 16 384 hash slots для горизонтального масштабирования, hash-tag `{}` для co-location |
+| Ceph (RGW + RADOS) | Объектное хранилище: вложения (~126 ПБ/год), бэкапы PG/Scylla/CH/Redis | S3-совместимый API, self-hosted, Erasure Coding 8+3 (overhead ×1.375 vs ×3 у replication), multisite-репликация между ДЦ |
+
+### Inference / GPU
+
+| Технология | Область применения | Почему |
+| --- | --- | --- |
+| NVIDIA H100 (SXM5, 80 ГБ HBM3) | `gpu-worker` pods в US East/West | Текущий production-выбор для inference-серверов LLM; HBM3 даёт пропускную способность памяти под KV-cache |
+| vLLM | Inference-движок на GPU-воркерах | PagedAttention + continuous batching (§7.1); throughput ×2-24 vs HF Transformers [^15]; production-проверен |
+| NCCL / InfiniBand | Tensor-parallel между GPU внутри одной ноды | Стандарт для collective-операций (`all-reduce`) при TP-инференсе моделей >70B параметров |
+
+### Контейнеризация и оркестрация
+
+| Технология | Область применения | Почему |
+| --- | --- | --- |
+| Docker | Сборка и упаковка сервисов | Стандарт; одинаковый артефакт от dev до prod |
+| Kubernetes | Оркестрация stateless-пулов, HPA, self-healing, rolling update (§4) | Декларативная модель `Deployment` / `DaemonSet` / `Service`, нативная интеграция с MetalLB и ingress-nginx |
+| Helm | Параметризация и версионирование манифестов | Один и тот же чарт раскатывается в 4 ДЦ с разными values; rollback одной командой |
+
+### Наблюдаемость
+
+| Технология | Область применения | Почему |
+| --- | --- | --- |
+| Prometheus | Time-series метрики: RPS, latency, queue depth, GPU utilization | Pull-модель, scrape `/metrics` со всех pod-ов; histogram quantile для p95/p99 SLI |
+| Grafana | Дашборды и алерты | Единый UI поверх Prometheus / Loki / Tempo |
+| Loki | Централизованные логи (`request_id`-correlated) | Дешёвое хранение (object storage backend), запросы LogQL по labels без полнотекстового индекса |
+| Tempo (Grafana) | Distributed traces (`trace_id` = `request_id`, см. §5.2) | Trace-id sharding; backend в Ceph RGW; интеграция с Grafana без отдельного UI |
+
+# 9. Обеспечение надёжности
+
+## 9.1 Резервирование компонентов
+
+| Компонент | Схема резервирования | Поведение при отказе |
+| --- | --- | --- |
+| Anycast `/24` | 4 ДЦ анонсируют один префикс; failover через BGP withdraw / AS-path prepending (§3.5) | Отказ ДЦ → withdraw → клиенты Anycast-рутятся в ближайший живой ДЦ за 30–90 сек |
+| Edge L4 (MetalLB) | DaemonSet на каждой edge-ноде; `externalTrafficPolicy: Local`, ECMP по живым speaker-pod-ам | Отказ edge-ноды → MetalLB снимает её из ECMP, трафик уходит на соседние edge-ноды |
+| Edge L7 (ingress-nginx) | DaemonSet на каждой edge-ноде, **2N @ 50%** (§4.3) — 30 нод глобально | Отказ половины парка → оставшиеся выходят на 100% без деградации |
+| Stateless backend (`api-gateway`, `chat`, `files`, `regional-inference`, `inference-scheduler`) | `Deployment` + `HPA`, **N+1**; `proxy_next_upstream` ретраит на следующий pod (§4.4) | Отказ pod-а → readiness probe → kube-proxy исключает из Service; ретрай прозрачен для клиента |
+| GPU workers | N+M (запас под отказ ноды); inference-scheduler возвращает 503 / Retry-After при перегрузке | Отказ GPU-ноды → scheduler перестаёт назначать; клиент ретраит с тем же `request_id` (§5.2) |
+| PostgreSQL (user data + attachments + audit_log) | Patroni + etcd; **1 primary + 1 sync + 1 async replica** на шард; PgBouncer перед PG; Citus reference tables на всех worker-ах | Отказ primary → Patroni promote sync-реплики за ~10 сек, RPO=0 |
+| PostgreSQL (billing_accounts) | Отдельный кластер в US East; **1 primary + 1 sync replica (same AZ) + 1 async replica в US West** | Отказ primary → promote sync (RPO=0); полный отказ US East → ручной promote async в US West (RPO ≤ 5 сек) |
+| ScyllaDB (messages) | Multi-DC `NetworkTopologyStrategy`, **RF=3 в каждом DC, total RF=12**; LOCAL_QUORUM=2 (§6.5) | Отказ 1 ноды в DC → LOCAL_QUORUM из 2 (RPO=0, RTO=0); отказ целого DC → клиент-драйвер переключается на соседний |
+| Redis Cluster (sessions, apikey, rate_limits, caches) | **1 master + 1 replica на slot** в каждом регионе; auto-failover 5–15 сек | Отказ master → replica promote; cache-warm — пересоздание `sess:` на логине, `rl:` — из живого трафика |
+| ClickHouse (usage_records) | ReplicatedMergeTree, **2 реплики на shard** (8 shards × 2 = 16 нод) в US East | Отказ одной реплики → запросы идут на вторую; кластер пересинхронизирует через ZooKeeper |
+| Ceph RGW (вложения, бэкапы) | **Erasure Coding 8+3** (переживает потерю 3 OSD одновременно); multisite-репликация US East → US West (sync) → EU/APAC (async) | Отказ OSD → CRUSH перестроит placement, данные доступны через parity; отказ ДЦ → клиент уходит в соседний RGW endpoint |
+| Cross-DC backbone | 2× 100 Гбит/с DWDM с geo-diverse физическими путями между US East ↔ US West / EU / APAC | Обрыв одного линка → BGP внутри iBGP переключает на резервный путь за единицы секунд |
+| Kubernetes control plane | **3 master-ноды + 3 etcd** в каждом ДЦ; кворум переживает отказ 1 ноды | Отказ master / etcd-ноды → API-сервер остаётся доступен, scheduler-leader перевыбирается |
+| Observability (Prometheus, Grafana, Loki, Tempo) | 2 экземпляра Prometheus / Alertmanager / Grafana в HA; Loki/Tempo с storage backend в Ceph RGW | Отказ одного экземпляра → второй продолжает; пользовательский трафик не затронут |
+
+## 9.2 Сценарии деградации
+
+| Сценарий | Что остаётся доступным | Что деградирует | Почему система не падает |
+| --- | --- | --- | --- |
+| Отказ одной edge-ноды | Весь трафик ДЦ продолжает приниматься | -1 нода из 6–10 (зависит от региона) — снижается запас по пропускной способности | MetalLB снимает BGP-анонс, остальные ноды в 2N-парке держат всю нагрузку |
+| Отказ одного stateless pod-а | Все API работают | Кратковременный рост latency | N+1 + HPA: остальные реплики разбирают нагрузку, k8s поднимает новый pod |
+| Отказ primary PG (user data) | После failover (~10 сек) — все API работают | Кратковременная недоступность login / write-операций | Patroni promote sync-реплики; reads с async-реплики не прерываются |
+| Отказ primary PG (billing) | Чтение баланса работает с реплики; новые API-запросы блокируются на reserve до promote | Кратковременная недоступность API pay-as-you-go | Sync-реплика в той же AZ promote за <5 сек, RPO=0 |
+| Отказ 1 ноды ScyllaDB в DC | Чтение/запись всех сообщений работают | Нет деградации | LOCAL_QUORUM=2 при RF=3 переживает отказ 1 ноды локально |
+| Полный отказ ДЦ EU | Web/API для пользователей EU уходит в US East (Anycast fallback, §3.5) | TTFT для EU +80–150 мс; нагрузка на US East ×2 на короткое окно | Anycast withdraw, ScyllaDB-данные есть в остальных 3 ДЦ (RF=12); inference уже централизован в US |
+| Полный отказ US East И US West (одновременный) | HTTP-слой EU/APAC работает: history, list, login, UI | Новые inference возвращают 503 — GPU только в США | Осознанный компромисс: вторая GPU-площадка вне США удвоила бы инфраструктурные расходы (§3.5) |
+| Отказ Redis-кластера в регионе | Чтение PG работает | Сессии теряются (юзер перелогинится); rate-limit временно открыт; reference-cache → PG (повышенная нагрузка) | Source of truth — PG; Redis не авторитетен. После восстановления sessions пересоздаются на логине |
+| Отказ Ceph RGW в регионе | Чтение старых вложений работает (multisite копия) | Новые upload-ы недоступны в регионе до восстановления | EC 8+3 переживает потерю 3 OSD одновременно; полный отказ региона → клиент льёт в соседний |
+| Отказ ClickHouse | API/Web работают | Биллинг-дашборды и анти-абуз недоступны | `usage_records` — append-only OLAP, не на горячем пути; биллинг-резерв (`billing_accounts`) идёт в PG, не CH |
+| Отказ Observability | Весь пользовательский трафик работает | Метрики, логи, трейсы недоступны | Observability не на serving path; алерты дублируются через PagerDuty webhook |
+
 # Источники
 
 [^1]: OpenAI. *The next phase of enterprise AI* https://openai.com/index/next-phase-of-enterprise-ai/
@@ -1593,3 +1825,9 @@ PgBouncer — легковесный пулер соединений для Post
 [^13]: Nginx Blog. *Testing Performance of NGINX Ingress Controller for Kubernetes.* https://blog.nginx.org/blog/testing-performance-nginx-ingress-controller-kubernetes
 
 [^14]: Nginx Blog. *Testing the Performance of NGINX and NGINX Plus Web Servers.* https://blog.nginx.org/blog/testing-the-performance-of-nginx-and-nginx-plus-web-servers
+
+[^15]: Kwon W., Li Z., Zhuang S. et al. *Efficient Memory Management for Large Language Model Serving with PagedAttention* (vLLM, SOSP 2023). https://arxiv.org/abs/2309.06180
+
+[^16]: Yu G.-I., Jeong J. S., Kim G.-W. et al. *Orca: A Distributed Serving System for Transformer-Based Generative Models* (OSDI 2022). https://www.usenix.org/conference/osdi22/presentation/yu
+
+[^17]: Zheng L., Yin L., Xie Z. et al. *SGLang: Efficient Execution of Structured Language Model Programs* (2024). https://arxiv.org/abs/2312.07104
