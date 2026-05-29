@@ -1159,7 +1159,7 @@ Wide-column: row с фиксированным `partition key` (определя
 | `conversations` | PostgreSQL + Citus | `hash(user_id)` (colocated с `users`) | colocated с `users` | US East + US West |
 | `api_keys` | PostgreSQL + Citus | `hash(user_id)` (colocated с `users`) | colocated с `users` | US East + US West |
 | `attachments` (метаданные) | PostgreSQL + Citus | `hash(user_id)` (colocated с `users`) | colocated с `users` | US East + US West |
-| `billing_accounts` | PostgreSQL (отдельный кластер) | `hash(user_id) % 32` | 1 primary + 1 sync replica (same AZ) + 1 async replica (US West) | US East only |
+| `billing_accounts` | PostgreSQL (отдельный кластер) | `hash(user_id) % 32` | 1 primary + 1 sync replica (другая зона отказа US East) + 1 async replica (US West) | primary US East; DR US West |
 | `audit_log` | PostgreSQL | `PARTITION BY toYYYYMMDD(created_at)` + `hash(user_id) % 16` | 1 primary + 1 async replica | US East only |
 | `messages` | ScyllaDB | partition `conv_id` (Murmur3), clustering `(created_at DESC, message_id)` | multi-DC: RF=3 в каждом DC; total RF=12 (LOCAL_QUORUM=2 устойчив к отказу 1 ноды) | все 4 ДЦ |
 | `usage_records` | ClickHouse | `hash(user_id) % 8`, `PARTITION BY toYYYYMM(created_at)` | ReplicatedMergeTree, 2 реплики на shard | US East only |
@@ -1228,7 +1228,7 @@ erDiagram
         UUID request_id "IDX: (request_id)"
     }
     billing_accounts {
-        UUID user_id PK "shard: hash(user_id) % 32, US East only"
+        UUID user_id PK "shard: hash(user_id) % 32, primary US East; DR US West"
         DECIMAL balance "IDX: (balance) partial"
         DECIMAL reserved
     }
@@ -1554,15 +1554,15 @@ PgBouncer — легковесный пулер соединений для Post
 
 | Хранилище | Failover (онлайн) | Backup (catastrophic) | Хранение бэкапа |
 | --- | --- | --- | --- |
-| PostgreSQL (user data) | sync+async replicas; promote ~10 сек | pg_basebackup + WAL archiving (RPO < 1 мин, RTO < 15 мин) | 30 дней |
-| PostgreSQL (billing_accounts) | sync replica (same AZ) + async (US West); promote <5 сек, RPO=0 | pg_basebackup + WAL archiving (RPO < 1 мин, RTO < 15 мин) | 1 год |
-| PostgreSQL (attachments метаданные) | sync+async replicas; promote ~10 сек | pg_basebackup + WAL archiving (RPO < 1 мин, RTO < 15 мин) | 30 дней |
-| PostgreSQL (audit_log) | async replica | pg_basebackup + WAL + dump старых партиций (RPO < 1 мин, RTO < 30 мин) | cold-tier, 7 лет |
-| ScyllaDB | RF=3 в каждом DC; потеря 1 ноды → LOCAL_QUORUM из 2 (RPO=0, RTO=0); потеря целого DC → переключение на соседний DC через клиент-драйвер | `nodetool snapshot` ежедневно, инкрементальный backup (commitlog) каждые 15 мин — для отката от corruption / accidental delete (RPO ≤ 15 мин, RTO 2–6 ч на восстановление одного DC из бэкапа) | 14 дней |
-| ClickHouse | ReplicatedMergeTree 2 реплики | `BACKUP TABLE`, ежедневно (RPO < 24 ч, RTO < 1 ч) | 90 дней |
-| Redis (sessions, apikey_cache) | 1 master + 1 replica на slot; auto-failover Redis Cluster ~5–15 сек, RPO 0 в синхронном режиме | RDB ежечасно + AOF (RPO < 1 ч); RTO для полного restore 100 ГБ — 30–60 мин (загрузка с диска, прогрев). На практике используется failover, не restore | 7 дней |
+| PostgreSQL (user data) | sync replica в US East даёт RPO=0 при отказе primary; async replica в US West для потери региона, RPO = фактический WAL replay lag | pg_basebackup + WAL archiving (RPO < 1 мин, RTO < 15 мин) | 30 дней |
+| PostgreSQL (billing_accounts) | sync replica в другой зоне отказа US East даёт RPO=0 при отказе primary/зоны; async replica в US West для DR, promote только при `replay_lag ≤ 5 сек`, иначе RPO = фактический lag | pg_basebackup + WAL archiving (RPO < 1 мин, RTO < 15 мин) | 1 год |
+| PostgreSQL (attachments метаданные) | sync replica в US East даёт RPO=0 при отказе primary; async replica в US West для потери региона, RPO = фактический WAL replay lag | pg_basebackup + WAL archiving (RPO < 1 мин, RTO < 15 мин) | 30 дней |
+| PostgreSQL (audit_log) | async replica; online RPO = фактический WAL replay lag | pg_basebackup + WAL + dump старых партиций (RPO < 1 мин, RTO < 30 мин) | cold-tier, 7 лет |
+| ScyllaDB | RF=3 в каждом DC; потеря 1 ноды → LOCAL_QUORUM из 2 (RPO=0, RTO=0); потеря целого DC → RPO = lag меж-ДЦ репликации для последних записей | `nodetool snapshot` ежедневно, инкрементальный backup (commitlog) каждые 15 мин — для отката от corruption / accidental delete (RPO ≤ 15 мин, RTO 2–6 ч на восстановление одного DC из бэкапа) | 14 дней |
+| ClickHouse | ReplicatedMergeTree 2 реплики; после принятого insert отказ 1 реплики не теряет данные, но async insert у клиента допускает задержку записи до ~1 сек | `BACKUP TABLE`, ежедневно (RPO < 24 ч, RTO < 1 ч) | 90 дней |
+| Redis (sessions, apikey_cache) | 1 master + 1 replica на slot; auto-failover Redis Cluster ~5–15 сек; RPO не является бизнес-гарантией, потому что cache/session пересоздаются из PG или логина | RDB ежечасно + AOF (RPO < 1 ч); RTO для полного restore 100 ГБ — 30–60 мин (загрузка с диска, прогрев). На практике используется failover, не restore | 7 дней |
 | Redis (rate_limits) | replica failover ~5 сек | не бэкапится — TTL 60 сек / 3 ч / 24 ч, восстанавливается из живого трафика | — |
-| Ceph RGW (attachments blob) | EC 8+3 (переживает потерю 3 OSD) + multisite-replication | Object Versioning + replica buckets (RPO < 15 мин cross-region, RTO native через смену endpoint) | cold-tier 3 года |
+| Ceph RGW (attachments blob) | EC 8+3 даёт RPO=0 при отказе OSD; при потере региона RPO = lag multisite-репликации, целевой <15 мин | Object Versioning + replica buckets (RPO < 15 мин cross-region, RTO native через смену endpoint) | cold-tier 3 года |
 
 Кэш Redis и in-flight inference-состояние не являются источником истины: sessions пересоздаются на логине, rate-limits — из текущего трафика, in-flight inference — клиент ретраит с тем же `request_id`.
 
@@ -1763,6 +1763,8 @@ PgBouncer — легковесный пулер соединений для Post
 
 ## 9.1 Резервирование компонентов
 
+RPO/RTO ниже относится к онлайн-failover, а не к восстановлению из бэкапа. Для sync-реплик RPO=0 верен только при отказе primary-ноды или одной зоны отказа; для async-реплик RPO равен фактическому lag репликации.
+
 | Компонент | Схема резервирования | Поведение при отказе |
 | --- | --- | --- |
 | Anycast `/24` | 4 ДЦ анонсируют один префикс; failover через BGP withdraw / AS-path prepending (§3.5) | Отказ ДЦ → withdraw → клиенты Anycast-рутятся в ближайший живой ДЦ за 30–90 сек |
@@ -1770,12 +1772,13 @@ PgBouncer — легковесный пулер соединений для Post
 | Edge L7 (ingress-nginx) | DaemonSet на каждой edge-ноде, **2N @ 50%** (§4.3) — 30 нод глобально | Отказ половины парка → оставшиеся выходят на 100% без деградации |
 | Stateless backend (`api-gateway`, `chat`, `files`, `regional-inference`, `inference-scheduler`) | `Deployment` + `HPA`, **N+1**; `proxy_next_upstream` ретраит на следующий pod (§4.4) | Отказ pod-а → readiness probe → kube-proxy исключает из Service; ретрай прозрачен для клиента |
 | GPU workers | N+M (запас под отказ ноды); inference-scheduler возвращает 503 / Retry-After при перегрузке | Отказ GPU-ноды → scheduler перестаёт назначать; клиент ретраит с тем же `request_id` (§5.2) |
-| PostgreSQL (user data + attachments + audit_log) | Patroni + etcd; **1 primary + 1 sync + 1 async replica** на шард; PgBouncer перед PG; Citus reference tables на всех worker-ах | Отказ primary → Patroni promote sync-реплики за ~10 сек, RPO=0 |
-| PostgreSQL (billing_accounts) | Отдельный кластер в US East; **1 primary + 1 sync replica (same AZ) + 1 async replica в US West** | Отказ primary → promote sync (RPO=0); полный отказ US East → ручной promote async в US West (RPO ≤ 5 сек) |
-| ScyllaDB (messages) | Multi-DC `NetworkTopologyStrategy`, **RF=3 в каждом DC, total RF=12**; LOCAL_QUORUM=2 (§6.5) | Отказ 1 ноды в DC → LOCAL_QUORUM из 2 (RPO=0, RTO=0); отказ целого DC → клиент-драйвер переключается на соседний |
-| Redis Cluster (sessions, apikey, rate_limits, caches) | **1 master + 1 replica на slot** в каждом регионе; auto-failover 5–15 сек | Отказ master → replica promote; cache-warm — пересоздание `sess:` на логине, `rl:` — из живого трафика |
-| ClickHouse (usage_records) | ReplicatedMergeTree, **2 реплики на shard** (8 shards × 2 = 16 нод) в US East | Отказ одной реплики → запросы идут на вторую; кластер пересинхронизирует через ZooKeeper |
-| Ceph RGW (вложения, бэкапы) | **Erasure Coding 8+3** (переживает потерю 3 OSD одновременно); multisite-репликация US East → US West (sync) → EU/APAC (async) | Отказ OSD → CRUSH перестроит placement, данные доступны через parity; отказ ДЦ → клиент уходит в соседний RGW endpoint |
+| PostgreSQL (user data + attachments metadata) | Patroni + etcd; **1 primary + 1 sync replica в US East + 1 async replica в US West** на шард; PgBouncer перед PG; Citus reference tables на всех worker-ах | Отказ primary-ноды → Patroni promote sync-реплики за ~10 сек, RPO=0. Потеря US East → promote async-реплики в US West, RPO = фактический WAL replay lag |
+| PostgreSQL (audit_log) | Append-only PG-кластер: primary + async replica + WAL archiving / cold-tier archive (§6.12) | Отказ primary → promote async-реплики, RPO = фактический WAL replay lag; восстановление из бэкапа даёт RPO < 1 мин |
+| PostgreSQL (billing_accounts) | Отдельный кластер в US East: **1 primary + 1 sync replica в другой зоне отказа** для локального RPO=0; **async replica в US West** для DR; lag контролируется через `pg_stat_replication.replay_lag`, порог 5 сек | Отказ primary/зоны отказа → promote sync (RPO=0, RTO <5 сек). Полный отказ US East → API pay-as-you-go fail-closed; ручной promote US West только если `replay_lag ≤ 5 сек`, иначе RPO = фактический lag async-реплики |
+| ScyllaDB (messages) | Multi-DC `NetworkTopologyStrategy`, **RF=3 в каждом DC, total RF=12**; LOCAL_QUORUM=2 (§6.5) | Отказ 1 ноды в DC → LOCAL_QUORUM из 2 (RPO=0, RTO=0). Потеря целого DC → клиент-драйвер переключается на соседний DC; RPO для последних записей = lag меж-ДЦ репликации |
+| Redis Cluster (sessions, api_key cache, rate_limits, caches) | **1 master + 1 replica на slot** в каждом регионе; auto-failover 5–15 сек; Redis не является source of truth для денег или сообщений | Отказ master → replica promote; cache warm-up из PG, `sess:` пересоздаётся на логине, `rl:` восстанавливается из текущего трафика. Для rate-limit RPO не применяется, потому что счётчики TTL-based |
+| ClickHouse (usage_records) | ReplicatedMergeTree, **2 реплики на shard** (8 shards × 2 = 16 нод) в US East | Отказ одной реплики → запросы идут на вторую. Потеря обеих реплик shard-а → restore из backup с RPO <24 ч; биллинг-резерв (`billing_accounts`) остаётся в PG и не зависит от CH |
+| Ceph RGW (вложения, бэкапы) | **Erasure Coding 8+3** (переживает потерю 3 OSD одновременно); multisite-репликация между регионами | Отказ OSD → RPO=0, CRUSH перестраивает placement. Потеря региона → клиент уходит в соседний RGW endpoint; RPO = lag multisite-репликации, целевой <15 мин |
 | Cross-DC backbone | 2× 100 Гбит/с DWDM с geo-diverse физическими путями между US East ↔ US West / EU / APAC | Обрыв одного линка → BGP внутри iBGP переключает на резервный путь за единицы секунд |
 | Kubernetes control plane | **3 master-ноды + 3 etcd** в каждом ДЦ; кворум переживает отказ 1 ноды | Отказ master / etcd-ноды → API-сервер остаётся доступен, scheduler-leader перевыбирается |
 | Observability (Prometheus, Grafana, Loki, Tempo) | 2 экземпляра Prometheus / Alertmanager / Grafana в HA; Loki/Tempo с storage backend в Ceph RGW | Отказ одного экземпляра → второй продолжает; пользовательский трафик не затронут |
@@ -1787,11 +1790,12 @@ PgBouncer — легковесный пулер соединений для Post
 | Отказ одной edge-ноды | Весь трафик ДЦ продолжает приниматься | -1 нода из 6–10 (зависит от региона) — снижается запас по пропускной способности | MetalLB снимает BGP-анонс, остальные ноды в 2N-парке держат всю нагрузку |
 | Отказ одного stateless pod-а | Все API работают | Кратковременный рост latency | N+1 + HPA: остальные реплики разбирают нагрузку, k8s поднимает новый pod |
 | Отказ primary PG (user data) | После failover (~10 сек) — все API работают | Кратковременная недоступность login / write-операций | Patroni promote sync-реплики; reads с async-реплики не прерываются |
-| Отказ primary PG (billing) | Чтение баланса работает с реплики; новые API-запросы блокируются на reserve до promote | Кратковременная недоступность API pay-as-you-go | Sync-реплика в той же AZ promote за <5 сек, RPO=0 |
+| Отказ primary PG (billing) | Чтение баланса работает с реплики; новые API-запросы блокируются на reserve до promote | Кратковременная недоступность API pay-as-you-go | Sync-реплика в другой зоне отказа US East promote за <5 сек, RPO=0 |
+| Полный отказ US East для billing | Web и неплатёжные API работают | Новые API pay-as-you-go fail-closed до ручного решения; in-flight paid-запросы ретраятся клиентом с тем же `request_id` | Async-реплика в US West не промоутится автоматически: если `replay_lag ≤ 5 сек`, promote с RPO до 5 сек; если lag выше, RPO равен фактическому lag async-реплики |
 | Отказ 1 ноды ScyllaDB в DC | Чтение/запись всех сообщений работают | Нет деградации | LOCAL_QUORUM=2 при RF=3 переживает отказ 1 ноды локально |
-| Полный отказ ДЦ EU | Web/API для пользователей EU уходит в US East (Anycast fallback, §3.5) | TTFT для EU +80–150 мс; нагрузка на US East ×2 на короткое окно | Anycast withdraw, ScyllaDB-данные есть в остальных 3 ДЦ (RF=12); inference уже централизован в US |
+| Полный отказ ДЦ EU | Web/API для пользователей EU уходит в US East (Anycast fallback, §3.5) | TTFT для EU +80–150 мс; нагрузка на US East ×2 на короткое окно | Anycast withdraw; ScyllaDB-данные есть в остальных ДЦ, кроме последних записей в пределах lag меж-ДЦ репликации; inference уже централизован в US |
 | Полный отказ US East И US West (одновременный) | HTTP-слой EU/APAC работает: history, list, login, UI | Новые inference возвращают 503 — GPU только в США | Осознанный компромисс: вторая GPU-площадка вне США удвоила бы инфраструктурные расходы (§3.5) |
-| Отказ Redis-кластера в регионе | Чтение PG работает | Сессии теряются (юзер перелогинится); rate-limit временно открыт; reference-cache → PG (повышенная нагрузка) | Source of truth — PG; Redis не авторитетен. После восстановления sessions пересоздаются на логине |
+| Отказ Redis-кластера в регионе | Чтение PG работает | Сессии теряются (юзер перелогинится); Web rate-limit переходит на локальный token-bucket, API fail-closed / консервативный лимит; reference-cache → PG (повышенная нагрузка) | Source of truth — PG; Redis не авторитетен. После восстановления sessions пересоздаются на логине |
 | Отказ Ceph RGW в регионе | Чтение старых вложений работает (multisite копия) | Новые upload-ы недоступны в регионе до восстановления | EC 8+3 переживает потерю 3 OSD одновременно; полный отказ региона → клиент льёт в соседний |
 | Отказ ClickHouse | API/Web работают | Биллинг-дашборды и анти-абуз недоступны | `usage_records` — append-only OLAP, не на горячем пути; биллинг-резерв (`billing_accounts`) идёт в PG, не CH |
 | Отказ Observability | Весь пользовательский трафик работает | Метрики, логи, трейсы недоступны | Observability не на serving path; алерты дублируются через PagerDuty webhook |
