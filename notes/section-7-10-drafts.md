@@ -29,8 +29,8 @@
    │ EU Region               │
    │  Nginx (TLS, SSE)       │
    │  └─► API Gateway        │
-   │      ├─► Auth Service (verify cookie/API token)
-   │      ├─► Rate Limiter (Redis: check + incr, per-region)
+   │      ├─► Auth middleware (Redis cache → PG on miss)
+   │      ├─► Rate-limit middleware (Redis: check + incr, per-region)
    │      ├─► Billing Reservation (PG, US) — reserve funds (API only)
    │      └─► Chat Service
    │          └─► Regional Inference Service
@@ -174,15 +174,15 @@ Pull выигрывает по трём осям сразу: **intra-region тр
 
 ### Billing Reservation — глобально централизован
 
-В отличие от rate-лимитера, деньги **нельзя** списывать независимо в двух регионах — пользователь мог бы исчерпать баланс дважды. Поэтому `billing_accounts` живёт в **одном** PostgreSQL-кластере в US East.
+В отличие от rate-лимитера, деньги **нельзя** списывать независимо в двух регионах — пользователь мог бы исчерпать баланс дважды. Поэтому `billing_accounts` живёт в **одном active-primary** PostgreSQL-кластере: primary в US East, DR async replica в US West.
 
 | Аспект                   | Решение                                                     |
 | ------------------------ | ----------------------------------------------------------- |
 | Нагрузка                 | Только API: ~8 700 RPS peak (Web использует tier-лимиты Rate Limiter) |
 | Latency от EU/APAC       | +80–150 мс — допустимо в рамках pre-inference шага          |
 | Consistency              | Strong (SERIALIZABLE-транзакции для reserve / finalize)     |
-| Failover                 | Sync-реплика в другой AZ US East (RPO=0, автопромоут), async-реплика в US West для DR (ручной promote при катастрофе US East, потеря ≤5 сек) |
-| Shard key                | `hash(user_id) % 64` — все операции по одному аккаунту на одном шарде |
+| Failover                 | Sync-реплика в другой зоне отказа US East (RPO=0, автопромоут), async-реплика в US West для DR; promote только при `replay_lag ≤ 5 сек`, иначе RPO равен фактическому lag |
+| Shard key                | `hash(user_id) % 32` — все операции по одному аккаунту на одном шарде |
 
 Flow биллинга для API-запроса:
 

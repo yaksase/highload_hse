@@ -23,13 +23,13 @@
 ### Edge
 
 * **Роль:** ingress-nginx (DaemonSet) + MetalLB speaker (DaemonSet). На пути внешнего HTTPS-трафика.
-* **Конфигурация:** **32 vCPU / 64 GB RAM / 2×25 GbE NIC** (TLS handshake CPU-bound; 50 Gbps NIC даёт запас под пиковый throughput). Локальный SSD 200 GB под логи/буферы.
+* **Конфигурация:** **16 vCPU / 32 GB RAM / 1×25 GbE NIC**. Nginx плохо масштабируется выше 16 ядер (плато на 16 CPU по бенчмарку [^13]), поэтому 16 vCPU — оптимальная единица; пакетируется через число нод. Локальный SSD 200 GB под логи/буферы.
 * **Число (из расчёта §4.3, модель 2N @ 50%):**
-  * US East: 4
-  * US West: 4
-  * EU Central: 6
-  * APAC: 6
-* **Итого: 20 нод.**
+  * US East: 6
+  * US West: 6
+  * EU Central: 10
+  * APAC: 8
+* **Итого: 30 нод.** Узкое место — concurrent SSE connections (1.2M peak глобально), не CPU. По HTTPS RPS / TLS CPS у каждой ноды 5–10× запас.
 
 ### Worker
 
@@ -80,16 +80,16 @@ HPA масштабирует выше baseline под текущую нагру�
   * Конфигурация worker: 16 vCPU / 64 GB / 4 TB NVMe SSD / 10 GbE.
   * Реплики: 1 primary + 1 sync + 1 async = ×3.
   * Размещение: US East + US West.
-  * Число: TBD при заполнении §11 на основе размера шарда.
-* **billing_accounts:** отдельный кластер, SERIALIZABLE consistency. 32 шарда. US East only (см. §6.4).
+  * Число: закрыто в README §11 — 100 нод суммарно для user-кластера (primary/sync/async + coordinators).
+* **billing_accounts:** отдельный кластер, SERIALIZABLE consistency. 32 шарда. Primary в US East, DR async replica в US West (см. §6.4 / §9).
 * **audit_log:** US East only. 16 партиций по дате.
 * **subscription_tiers / models:** reference tables, logical replication на каждый шард.
 
 ### ScyllaDB
 
-* **messages + messages_by_request:** multi-DC keyspace, RF=3 в US East+West, RF=1 в EU+APAC.
-* Конфигурация ноды: 32 vCPU / 256 GB / 16 TB NVMe / 25 GbE.
-* Число (из §6.5): **6 нод × 4 ДЦ = 24 ноды**.
+* **messages + messages_by_request:** multi-DC keyspace, RF=3 в каждом DC (total RF=12) — LOCAL_QUORUM=2 устойчив к отказу 1 ноды локально.
+* Конфигурация ноды: 24 × 4 TB NVMe = 96 TB raw → ~60 TB usable / 32 vCPU / 256 GB / 25 GbE.
+* Число (из §6.5): **~155 нод × 4 ДЦ ≈ 620 нод суммарно** на 37 ПБ effective per year.
 
 ### ClickHouse
 
@@ -101,7 +101,7 @@ HPA масштабирует выше baseline под текущую нагру�
 
 * **sessions, rate_limits, tier_cache, model_cache:** per-region.
 * Конфигурация ноды: 8 vCPU / 64 GB / 1 TB NVMe / 10 GbE.
-* Число: ~16 master + 16 replica на регион (16384 hash slots / 1024 slots на master). Уточнить при §11.
+* Число: закрыто в README §11 — 4 master + 4 replica на регион, 32 Redis-ноды суммарно.
 * Размещение: ×4 региона.
 
 ### Ceph RGW
@@ -131,7 +131,7 @@ HPA масштабирует выше baseline под текущую нагру�
 Пиковый трафик cross-DC (из обсуждения в чате):
 * EU→US inference: ~9.2 Гбит/с peak
 * APAC→US inference: ~7.5 Гбит/с peak
-* US East→US West: репликация PG sync + Scylla multi-DC + Ceph multisite, ~10–20 Гбит/с peak
+* US East→US West: PG async DR replication + Scylla multi-DC + Ceph multisite, ~10–20 Гбит/с peak
 * Итого: 100 Gbps канала с большим запасом
 
 ### Edge-роутеры
@@ -154,11 +154,11 @@ HPA масштабирует выше baseline под текущую нагру�
 
 ---
 
-## 5. Что ещё нужно уточнить при заполнении §11
+## 5. Что закрыто при заполнении §11
 
-* [ ] Точное число worker-нод на ДЦ (после суммирования CPU/RAM по pod-ам + запас N+1).
-* [ ] Точное число H100 на US East / US West (зависит от выбранной модели — GPT-OSS 120B / Llama 3 70B / иное, тут нужно посчитать по batch capacity на 1 GPU и пиковому inference RPS).
-* [ ] Точное число PG worker-нод (после расчёта `users / shard size`).
-* [ ] Точное число Redis-нод per-region — сейчас в notes стоит «оверпровиженинг ×4», нужно пересчитать на основе peak QPS sessions/rate_limits.
-* [ ] DDoS-фильтрация — у upstream-провайдера или своя (Arbor TMS, FastNetMon).
-* [ ] CDN для статики (если будет в MVP web-UI) — Cloudflare / Fastly / своё.
+* [x] Worker-ноды: 4 на ДЦ, 16 суммарно.
+* [x] GPU-ноды: 320 в US East + 320 в US West, 640 суммарно.
+* [x] PostgreSQL user-cluster: 100 нод суммарно.
+* [x] Redis: 4 master + 4 replica на регион, 32 ноды суммарно.
+* [x] DDoS-фильтрация: у upstream-провайдера каждого ДЦ.
+* [x] CDN для статики: внешний CDN через `cdn.llm.com`, не входит в server bill of materials.
