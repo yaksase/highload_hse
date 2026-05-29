@@ -27,10 +27,10 @@
 ## Дополнительный функционал, обеспечивающий работу бизнеса
 
 - Аутентификация:
-  - Для веб-чата: кука, которая прикладывается к каждому запросу. Бэкенд ходит с кукой в Auth Service, который идет в БД за сессиями и сверяет подлинность и время жизни куки (1 месяц).
-  - Для API: с каждым запросом прикладываем API токен. Бэкенд ходит с токеном в Auth Service, который идет в БД и сверяет подлинность токена и его время жизни (условимся, что токен можно выдать максимум на 1 месяц).
+  - Для веб-чата: кука прикладывается к каждому запросу; auth-middleware в `chat` проверяет `sess:{token_hash}` в Redis, а при cache miss восстанавливает сессию из PostgreSQL.
+  - Для API: с каждым запросом прикладывается API-токен; `api-gateway` проверяет `apikey:{key_hash}` в Redis, а при cache miss читает `api_keys` из PostgreSQL.
 - Лимитирование:
-  - Для веб-чата: лимитирование по тирам подписки: Free, Plus, Pro, Max. Для каждого тира назначается лимит лимит токенов на input и output для каждой модели.
+  - Для веб-чата: лимитирование по тирам подписки: Free, Plus, Pro, Max. Для каждого тира назначаются лимиты сообщений и контекста для каждой модели.
   - Для API: usage-based лимитирование. Назначаем цену за N токенов на input и M токенов на output. По API токену определяется биллинг аккаунт и, перед запросом к inference-кластеру, идет резервирование цены запроса (прогоняем input через tokenizer, а для output считаем по max_output_tokens, которые заранее предопределены для каждой модели). После выполнения запроса возвращаем разницу между предварительной оценкой цены запроса и тем, сколько на самом деле потратилось.
 
 ## Реальные аналоги
@@ -75,8 +75,8 @@ Web и API — два разных профиля нагрузки: web — ко
 * **Горизонтальное масштабирование** — независимое масштабирование компонентов
 * **Глобальная балансировка** — распределение нагрузки между регионами
 * **Режим работы 24/7** — высокие требования к доступности
-* **Auth** — пользователю выдается идентификатор (кука Session_id для web, API токен для API), который живет 1 месяц. На каждый запрос от пользователя, бэкенду нужно сходить в Auth Service.
-* **Лимитирование запросов** — отдельный сервис Rate Limiting Service, который лимитирует запросы для конкретного пользователя
+* **Auth** — пользователю выдается идентификатор (кука `Session_id` для Web, API-токен для API), который живет 1 месяц. На каждый запрос auth-middleware проверяет Redis-кеш, а источник истины для сессий/API-ключей — PostgreSQL.
+* **Лимитирование запросов** — middleware в `api-gateway` / `chat`, который проверяет Redis-счётчики для конкретного пользователя или API-ключа
 * **Client-side image compression** — web/mobile-клиент ресайзит фото до ~1280×1280 и пережимает в JPEG q=80 перед upload-ом (как WhatsApp/iMessage). Финальный resize до 1024×1024 для vision-encoder делает GPU worker. Документы (PDF/DOCX/PPTX) идут «как есть».
 * **Хранение вложений только в исходном виде** — в объектном хранилище лежит оригинал блоба, эмбеддинги картинок не кэшируются
 
@@ -139,6 +139,8 @@ Web и API — два разных профиля нагрузки: web — ко
 | **Web** | 2.5 млрд | 28 935 | **57 870** | ~800 |
 | **API** | 3.375 млрд | 39 063 | **78 125** | ~6 400 |
 | **Итого** | 5.875 млрд | 67 998 | **135 996** | — |
+
+Для итоговых peak дальше используем `rounded total avg × 2`; сумма отдельно округлённых строк может отличаться на 1 RPS.
 
 API даёт **больше inference-RPS, чем Web** — длинный контекст в каждом запросе перевешивает меньшее число клиентов.
 
@@ -287,7 +289,7 @@ API даёт чуть больше concurrent SSE, чем Web — больше R
 | EU      | Frankfurt  | API + SSE                 | 35%       |
 | APAC    | Singapore  | API + SSE                 | 30%       |
 
-EU и APAC — только HTTP-слой (terminate TLS, держать SSE-соединения, проксировать inference в US). GPU-кластеров там нет.
+EU и APAC не держат GPU и PostgreSQL/ClickHouse primary: там остаются HTTP edge, локальный Redis, ScyllaDB и Ceph RGW, а inference проксируется в US.
 
 **Почему 4 ДЦ:**
 
@@ -302,7 +304,7 @@ EU и APAC — только HTTP-слой (terminate TLS, держать SSE-с�
 | ---------------- | --------------------------------------------------------------------------- |
 | TTFT для EU/APAC | 250–400 мс вместо 500–800 мс при single-region                              |
 | Доступность      | 4 независимых ДЦ; отказ одного → клиенты автоматически уходят в ближайший живой (§3.5) |
-| Стоимость        | 90% inference в США держит GPU $/токен на минимуме; в EU/APAC — только дешёвый HTTP/SSE-слой без дорогих H100 |
+| Стоимость        | Весь inference в США держит GPU $/токен на минимуме; в EU/APAC — только дешёвый HTTP/SSE-слой без дорогих H100 |
 
 ---
 
@@ -310,7 +312,7 @@ EU и APAC — только HTTP-слой (terminate TLS, держать SSE-с�
 
 Раскладываем суммарный HTTP-трафик из §2 (85 054 avg / 170 108 peak RPS, ~1.2 млн concurrent SSE) по регионам пропорционально доле аудитории. Это вход для §4 — сколько Nginx и SSE-серверов держать в каждом ДЦ.
 
-Доли 17.5/17.5/35/30% — worst-case по верхней границе Europe (28% + рост) и Asia-Pacific (32%, середина диапазона) на основе аналитики глобального трафика ChatGPT [^7][^8];
+Доли 17.5/17.5/35/30% — worst-case по верхней границе Europe (28% + рост) и Asia-Pacific (32%, середина диапазона) на основе аналитики глобального трафика ChatGPT [^3][^4][^5];
 
 | ДЦ        | HTTP RPS avg | HTTP RPS peak | Concurrent SSE peak |
 | --------- | ------------ | ------------- | ------------------- |
@@ -322,7 +324,7 @@ EU и APAC — только HTTP-слой (terminate TLS, держать SSE-с�
 
 Auth check (84 500 avg / 169 000 peak из §2.3) в этой таблице **не суммируется** — это не отдельный HTTP-запрос от клиента, а middleware-операция внутри pod-а (lookup в Redis `sess:{token_hash}` или валидация `api_key`), выполняемая на каждый внешний запрос. По нагрузке на ingress они уже учтены в `HTTP RPS peak`; по нагрузке на Redis — в §5.5.
 
-Все inference-запросы (67 998 avg / 135 996 peak RPS из §2) в итоге сходятся на GPU-кластерах в США независимо от того, в каком ДЦ они принимаются: EU/APAC — только HTTP-слой, проксирующий gRPC-стрим в US-GPU.
+Все inference-запросы (67 998 avg / 135 996 peak RPS из §2) в итоге сходятся на GPU-кластерах в США независимо от того, в каком ДЦ они принимаются: EU/APAC принимают внешний HTTP/SSE локально, но gRPC-стрим inference проксируют в US-GPU.
 
 ---
 
@@ -405,7 +407,7 @@ flowchart TD
 
 * US East — primary, US West — резерв. Inference Scheduler держит оба пула в горячем состоянии и переключает запросы на US West, если US East перегружен или недоступен.
 * При падении US East: HTTP-клиенты Северной Америки уходят в US West (по таблице выше), inference тоже идёт в US West.
-* **При одновременном отказе US East И US West** новый inference недоступен глобально — GPU-площадки только в США. EU/APAC продолжат принимать HTTP-запросы (history, list, login, UI работают), но новые промпты возвращают `503 Service Unavailable` до восстановления хотя бы одного US-региона. Это осознанный компромисс: вторая GPU-площадка вне США удвоила бы инфраструктурные расходы и не оправдана при разнесении US East/West по разным AZ/регионам с независимыми сетевыми и питающими подсистемами.
+* **При одновременном отказе US East И US West** новый inference недоступен глобально — GPU-площадки только в США. EU/APAC edge остаётся живым, но endpoints, которым нужны PostgreSQL/billing/GPU, деградируют: новые промпты возвращают `503 Service Unavailable`, login/list/API billing недоступны до восстановления хотя бы одного US-региона. Это осознанный компромисс: вторая GPU/PG-площадка вне США резко увеличила бы инфраструктурные расходы и не оправдана при разнесении US East/West по независимым регионам.
 
 ---
 
@@ -426,7 +428,7 @@ GPU только в США (§3.2) — значит **65% inference-запрос
 | US → EU+APAC (SSE назад)   | API SSE      | 78 125 × 0.65 × 7 КБ            |          2.8 |
 | **Итого**                  |              |                                 | **~54 in / ~5.5 out** |
 
-Среднесуточно (peak ÷ 2) — ~27 Гбит/с inbound в US, что даёт ~292 ТБ/сутки cross-DC. Доминируют Web-вложения (~78% потока): на больших объёмах их имеет смысл сжимать и токенизировать ближе к клиенту (EU/APAC `files` pod), а в US-GPU прокидывать уже компактные эмбеддинги — это снижает cross-DC до ~12 Гбит/с peak.
+Среднесуточно (peak ÷ 2) — ~27 Гбит/с inbound в US, что даёт ~292 ТБ/сутки cross-DC. Доминируют Web-вложения (~78% потока). Phase 2-оптимизация — сжимать и токенизировать вложения ближе к клиенту (EU/APAC `files` pod), а в US-GPU прокидывать уже компактные embeddings; в текущий расчёт и server bill of materials эта оптимизация не заложена.
 
 
 **Транспорт.** Все 4 ДЦ соединены **выделенными каналами связи** (арендованные у магистральных операторов), не через публичный Интернет.
@@ -488,7 +490,6 @@ flowchart LR
     class Ing,Spk edge;
     class SvcA,SvcC,SvcF,SvcR,SvcS worker;
     class Gw gpu;
-    class ApiSrv cp;
 ```
 
 L4-плоскость (MetalLB) принимает Anycast-пакеты и распределяет их между edge-нодами. Внутри k8s-кластера ingress-nginx (L7) терминирует TLS и маршрутизирует HTTP по `Host` на k8s Service нужного бэкенда; Service балансирует уже на конкретные pod-ы на worker-нодах. Между сервисами (chat / api-gateway → regional-inference → inference-scheduler → GPU Worker) — gRPC client-side LB: клиент сам ходит по списку endpoint-ов из k8s API. Control plane выделен отдельно — он управляет состоянием кластера, но **не находится на пути пользовательского трафика**.
@@ -745,7 +746,7 @@ API-клиенты тиров не имеют (pay-as-you-go); их монети
 
 | Метрика | Значение |
 | --- | --- |
-| Строк | ~50 (5 активных × ~10 версий за всё время) |
+| Строк | ~40 (4 активных × ~10 версий за всё время) |
 | Размер строки | ~100 B |
 | Общий объём | < 5 КБ |
 | QPS чтение | ~10 (миссы кеша; горячие данные на стороне Rate Limiter) |
@@ -919,7 +920,7 @@ API-клиенты авторизуются через `api_keys`; долгож�
 | --- | --- |
 | Строк | ~1 млрд (MAU — TTL = 30 сут покрывает весь месячный охват) |
 | Размер строки | ~96 B |
-| Общий объём | ~96 GB (in-memory, per-region; см. §6) |
+| Общий объём | ~96 GB global logical; largest region ~34 GB before replica (см. §6) |
 | QPS чтение | 84 500 avg / 169 000 peak (auth check на каждый HTTP-запрос, из §2.3) |
 | QPS запись | ~386 avg / ~772 peak (login = создание новой сессии, из §2.3) |
 | Консистентность | Strong |
@@ -1062,7 +1063,7 @@ Web — **RPS** на 60-секундном окне: живой человек �
 | --- | --- |
 | Строк | ~2 млрд (верхняя оценка с буфером; реалистично ~600M активных в моменте: 540M `msg_day` + 75M `msg_3h` + 5M `rps` + 10M API; буфер ×3 на пики и неравномерность нагрузки) |
 | Размер строки | ~50 B логически; ~100 B физически с overhead in-memory KV (см. §6.8) |
-| Общий объём | ~100 GB (in-memory, per-region) |
+| Общий объём | ~100 GB global logical; largest region ~35 GB before replica |
 | QPS чтение | ~170 000 peak (1 атомарный Lua-`check_and_incr` на каждый внешний HTTP-запрос; для inference это сразу несколько счётчиков под одним hash-tag, считается как одна Redis-операция) |
 | QPS запись | ~170 000 peak (тот же Lua-скрипт инкрементит счётчики атомарно) |
 | Консистентность | Strong (per-region); cross-region не реплицируется — пользователь привязан к региону Anycast (§3) |
@@ -1117,7 +1118,7 @@ Web — **RPS** на 60-секундном окне: живой человек �
 | messages | 1.83 трлн/год | 1.7 KB | 3.1 PB/год | 41 435 / 82 870 peak | 57 870 / 115 740 peak | Eventual |
 | api_keys | 100 млн | 170 B | 17 GB | 39 063 / 78 125 peak | 100 | Strong |
 | sessions | 1 млрд | 96 B | 96 GB | 84 500 / 169k peak | 386 / 772 peak | Strong |
-| rate_limits | ~2 млрд счётчиков (с буфером) | 50 B | ~100 GB | ~170k peak | ~170k peak | Strong (per-region) |
+| rate_limits | ~2 млрд счётчиков (с буфером) | 50 B | ~100 GB global logical | ~170k peak | ~170k peak | Strong (per-region) |
 | billing_accounts | 10 млн | 64 B | 640 MB | 39 063 / 78 125 peak | 78 125 / 156 250 peak | Strong (SERIALIZABLE) |
 | usage_records | 2.14 трлн/год | 116 B | ~243 TB/год | 1 000 | 67 998 / 135 996 peak | Eventual |
 | attachments | 64 млрд/год | 210 B | 13 TB/год метаданные + **~126 ПБ/год бинарники** | 3 750 peak | 8 100 peak (4 050 create + 4 050 status update) | Strong |
@@ -1152,10 +1153,10 @@ Wide-column: row с фиксированным `partition key` (определя
 
 | Таблица / данные | Хранилище | Шардирование / партиционирование | Репликация | Регион |
 | --- | --- | --- | --- | --- |
-| `subscription_tiers` | PostgreSQL reference table | не шардится; полная копия на каждом worker | logical replication во все шарды | master US East → все ДЦ |
-| `models` | PostgreSQL reference table | не шардится; полная копия на каждом worker | logical replication во все шарды | master US East → все ДЦ |
-| `web_tier_quotas` | PostgreSQL reference table | не шардится; полная копия на каждом worker | logical replication во все шарды | master US East → все ДЦ |
-| `users` | PostgreSQL + Citus | `hash(user_id) % 64` | 1 primary + 1 sync + 1 async replica | US East + US West |
+| `subscription_tiers` | PostgreSQL reference table | не шардится; полная копия на каждом worker | logical replication во все PG-шарды; Redis cache per-region | primary US East; replicas/caches per-region |
+| `models` | PostgreSQL reference table | не шардится; полная копия на каждом worker | logical replication во все PG-шарды; Redis cache per-region | primary US East; replicas/caches per-region |
+| `web_tier_quotas` | PostgreSQL reference table | не шардится; полная копия на каждом worker | logical replication во все PG-шарды; Redis cache per-region | primary US East; replicas/caches per-region |
+| `users` | PostgreSQL + Citus | `hash(user_id) % 64` | 1 primary + 1 sync replica (другая зона отказа US East) + 1 async replica (US West) | US East + US West |
 | `conversations` | PostgreSQL + Citus | `hash(user_id)` (colocated с `users`) | colocated с `users` | US East + US West |
 | `api_keys` | PostgreSQL + Citus | `hash(user_id)` (colocated с `users`) | colocated с `users` | US East + US West |
 | `attachments` (метаданные) | PostgreSQL + Citus | `hash(user_id)` (colocated с `users`) | colocated с `users` | US East + US West |
@@ -1163,9 +1164,9 @@ Wide-column: row с фиксированным `partition key` (определя
 | `audit_log` | PostgreSQL | `PARTITION BY toYYYYMMDD(created_at)` + `hash(user_id) % 16` | 1 primary + 1 async replica | US East only |
 | `messages` | ScyllaDB | partition `conv_id` (Murmur3), clustering `(created_at DESC, message_id)` | multi-DC: RF=3 в каждом DC; total RF=12 (LOCAL_QUORUM=2 устойчив к отказу 1 ноды) | все 4 ДЦ |
 | `usage_records` | ClickHouse | `hash(user_id) % 8`, `PARTITION BY toYYYYMM(created_at)` | ReplicatedMergeTree, 2 реплики на shard | US East only |
-| `sessions` | Redis Cluster | 16 384 hash slots по `sess:{token_hash}` | 1 master + 1 replica на slot | per-region (×4) |
-| `rate_limits` | Redis Cluster | 16 384 hash slots по `{user_id}` (hash-tag для co-location всех счётчиков юзера) | 1 master + 1 replica на slot | per-region (×4) |
-| `attachments` (blob) | Ceph RGW | bucket per region; CRUSH-распределение по OSD | Erasure Coding 8+3 + multisite-репликация | US East+West (origin), EU/APAC (replicas) |
+| `sessions` | Redis Cluster | 16 384 hash slots по `sess:{token_hash}` | 1 master + 1 replica на slot | per-region local subset (×4) |
+| `rate_limits` | Redis Cluster | 16 384 hash slots по `{user_id}` (hash-tag для co-location всех счётчиков юзера) | 1 master + 1 replica на slot | per-region local subset (×4) |
+| `attachments` (blob) | Ceph RGW | bucket per region; CRUSH-распределение по OSD | Erasure Coding 8+3 + async multisite-репликация | upload origin = ближайший регион; DR/copies в остальных ДЦ |
 
 GPU-кластеры — только в US (см. §3.2). Долговременное хранение (durable state) синхронизировано с этим решением: PostgreSQL и ClickHouse централизованы в US, ScyllaDB размазан по всем регионам, Redis — per-region (близость к пользователю для auth/rate-limit на каждом HTTP-запросе).
 
@@ -1321,12 +1322,12 @@ SELECT create_distributed_table('attachments',   'user_id', colocate_with => 'us
 
 ### 6.4.2 Биллинг
 
-`billing_accounts` живёт в **отдельном** PG-кластере, шардируется по `user_id % 32`, но не co-located с пользовательским кластером.
+`billing_accounts` живёт в **отдельном** PG-кластере, шардируется по `hash(user_id) % 32`, но не co-located с пользовательским кластером.
 
 Причины:
 - `reserve` / `finalize` требуют SERIALIZABLE-транзакций без distributed coordination — централизованный кластер в US East снимает риск списать одни деньги дважды.
 - Failure domain не пересекается с пользовательскими данными: падение billing-кластера не валит весь API-канал.
-- Объём (~7 ГБ) намного меньше пользовательского — 32 шардов достаточно.
+- Логический объём <1 ГБ, поэтому узкое место не storage, а SERIALIZABLE write QPS и row-lock contention; 32 шарда дают ~4.9k write/s на primary-шард.
 
 ### 6.4.3 Справочники
 
@@ -1345,7 +1346,7 @@ SELECT create_reference_table('web_tier_quotas');
 | Таблица | Шардов | Обоснование |
 | --- | --- | --- |
 | users + colocated | 64 | 1 млрд users / 64 ≈ 15.6 млн строк на shard; один shard помещается в RAM worker-узла для hot-set |
-| billing_accounts | 16 | 10 млн API-клиентов / 16 ≈ 625k строк на shard; небольшое число шардов минимизирует distributed transaction overhead на `reserve`/`commit` |
+| billing_accounts | 32 | 10 млн API-клиентов / 32 ≈ 312k строк на shard; ~156k peak write QPS / 32 ≈ 4.9k write/s на primary-шард |
 | audit_log | 16 | Партиционирование по дате — основной механизм; шардирование по user_id внутри партиции для security-расследований |
 
 ---
@@ -1435,7 +1436,7 @@ ALTER TABLE usage_records ADD INDEX request_id_bloom request_id TYPE bloom_filte
 
 `cost` зафиксирован в момент записи (денормализация, см. §6.10) — ClickHouse не делает JOIN с `models` на горячем пути. Разбивка выручки по моделям — через external dictionary (подгрузка справочника `models` из PG в RAM ClickHouse с TTL 5 мин).
 
-Кластер централизован в US East (8 shards × 2 replicas = 16 нод). Регионалы льют биллинг через HTTP async insert (терпит +150 мс, биллинг — не критичный путь).
+Кластер централизован в US East (8 shards × 2 replicas = 16 нод). Региональные сервисы пишут `usage_records` через HTTP async insert (терпит +150 мс, потому что денежный `reserve/finalize` уже прошёл в PostgreSQL, а ClickHouse — аналитический контур).
 
 ---
 
@@ -1453,7 +1454,7 @@ Bucket в S3-совместимом API — логический контейн�
 
 ### Сайзинг
 
-Целевой объём — 126 ПБ/год накопления (см. §2.4). Hot-tier (быстрые NVMe-диски для свежих данных, год активного хранения) + cold-tier (медленные HDD, 1–3 года) = 378 ПБ raw. Erasure Coding 8+3 (объект режется на 8 data chunks + 3 parity chunks, parity считаются по схеме Reed-Solomon; переживает потерю 3 любых из 11 фрагментов; overhead по месту ×1.375 vs ×3 у простой replication):
+Целевой объём — 126 ПБ/год накопления (см. §2.3). Hot-tier (быстрые NVMe-диски для свежих 90 дней) + cold-tier (медленные HDD до 3 лет retention) = 378 ПБ raw. Erasure Coding 8+3 (объект режется на 8 data chunks + 3 parity chunks, parity считаются по схеме Reed-Solomon; переживает потерю 3 любых из 11 фрагментов; overhead по месту ×1.375 vs ×3 у простой replication):
 
 ```text
 Physical_capacity = 378 ПБ × 1.375 ≈ 520 ПБ
@@ -1462,7 +1463,7 @@ Nodes_total = 520 ПБ / 432 TB ≈ 1 200 OSD-нод
 Service_nodes = 3 (MON/MGR/RGW) × 4 региона = 12 узлов
 ```
 
-Распределение по регионам: US East ≈ 480 (40%), US West ≈ 360 (30%, основной DR-таргет), EU ≈ 240 (20%), APAC ≈ 120 (10%). Multisite-репликация US East → US West (sync) + US East → EU/APAC (async, для регуляторики).
+Распределение по регионам: US East ≈ 480 (40%), US West ≈ 360 (30%, основной DR-таргет), EU ≈ 240 (20%), APAC ≈ 120 (10%). Multisite-репликация между регионами асинхронная; для US West держим приоритетный DR-поток с целевым lag <15 мин, EU/APAC получают копии для локального чтения и регуляторики.
 
 Доступ приложений: `POST /v1/files` выдаёт presigned PUT URL → клиент льёт файл напрямую в региональный RGW endpoint, минуя ingress-nginx. Bucket-notification (S3-event) обновляет `attachments.status = ready` в PG.
 
@@ -1550,13 +1551,13 @@ PgBouncer — легковесный пулер соединений для Post
 
 Все PG-кластеры используют схему `pg_basebackup` (полный снимок кластера) + WAL archiving (Write-Ahead Log — журнал PG со всеми изменениями), что даёт PITR (Point-In-Time Recovery — восстановление на любой момент времени накатом WAL поверх базового снимка). Бэкапы складываются в Ceph RGW (`llm-backups`).
 
-Для **stateful-кластеров с большим объёмом** (ScyllaDB ~37 ПБ, Redis ~100 ГБ на регион) основной механизм отказоустойчивости — **онлайн-репликация** (RF в кластере + кросс-региональные реплики), а **резервное копирование закрывает только catastrophic recovery** (corruption, accidental DROP, ransomware). Поэтому RTO бэкапа на таком объёме измеряется часами, а production-RPO/RTO достигается через failover, не через restore.
+Для **stateful-кластеров с большим объёмом** (ScyllaDB ~37 ПБ, Redis ~200 ГБ global logical / <80 ГБ hot data в largest region до replica) основной механизм отказоустойчивости — **онлайн-репликация** (RF в кластере + кросс-региональные реплики), а **резервное копирование закрывает только catastrophic recovery** (corruption, accidental DROP, ransomware). Поэтому RTO бэкапа на таком объёме измеряется часами, а production-RPO/RTO достигается через failover, не через restore.
 
 | Хранилище | Failover (онлайн) | Backup (catastrophic) | Хранение бэкапа |
 | --- | --- | --- | --- |
-| PostgreSQL (user data) | sync replica в US East даёт RPO=0 при отказе primary; async replica в US West для потери региона, RPO = фактический WAL replay lag | pg_basebackup + WAL archiving (RPO < 1 мин, RTO < 15 мин) | 30 дней |
+| PostgreSQL (user data) | sync replica в другой зоне отказа US East даёт RPO=0 при отказе primary/зоны; async replica в US West для потери региона, RPO = фактический WAL replay lag | pg_basebackup + WAL archiving (RPO < 1 мин, RTO < 15 мин) | 30 дней |
 | PostgreSQL (billing_accounts) | sync replica в другой зоне отказа US East даёт RPO=0 при отказе primary/зоны; async replica в US West для DR, promote только при `replay_lag ≤ 5 сек`, иначе RPO = фактический lag | pg_basebackup + WAL archiving (RPO < 1 мин, RTO < 15 мин) | 1 год |
-| PostgreSQL (attachments метаданные) | sync replica в US East даёт RPO=0 при отказе primary; async replica в US West для потери региона, RPO = фактический WAL replay lag | pg_basebackup + WAL archiving (RPO < 1 мин, RTO < 15 мин) | 30 дней |
+| PostgreSQL (attachments метаданные) | sync replica в другой зоне отказа US East даёт RPO=0 при отказе primary/зоны; async replica в US West для потери региона, RPO = фактический WAL replay lag | pg_basebackup + WAL archiving (RPO < 1 мин, RTO < 15 мин) | 30 дней |
 | PostgreSQL (audit_log) | async replica; online RPO = фактический WAL replay lag | pg_basebackup + WAL + dump старых партиций (RPO < 1 мин, RTO < 30 мин) | cold-tier, 7 лет |
 | ScyllaDB | RF=3 в каждом DC; потеря 1 ноды → LOCAL_QUORUM из 2 (RPO=0, RTO=0); потеря целого DC → RPO = lag меж-ДЦ репликации для последних записей | `nodetool snapshot` ежедневно, инкрементальный backup (commitlog) каждые 15 мин — для отката от corruption / accidental delete (RPO ≤ 15 мин, RTO 2–6 ч на восстановление одного DC из бэкапа) | 14 дней |
 | ClickHouse | ReplicatedMergeTree 2 реплики; после принятого insert отказ 1 реплики не теряет данные, но async insert у клиента допускает задержку записи до ~1 сек | `BACKUP TABLE`, ежедневно (RPO < 24 ч, RTO < 1 ч) | 90 дней |
@@ -1574,7 +1575,7 @@ PgBouncer — легковесный пулер соединений для Post
 
 **Где применяется:** `gpu-worker` pods в US East / US West (§4.1).
 
-**Задача:** обслужить пиковые 137 996 inference-запросов/сек при autoregressive token-generation так, чтобы парк H100 был минимально возможным, а TTFT ≤ 300 мс.
+**Задача:** обслужить пиковые 135 996 inference-запросов/сек при autoregressive token-generation так, чтобы парк H100 был минимально возможным, а GPU-stage TTFT был ≤ 300 мс. Полный пользовательский TTFT с учётом межрегиональной сети приведён в §10.3.
 
 **Ограничения:** длина output варьируется (Web ~500 ток, API ~400 ток, std large); KV-cache живёт в HBM3 GPU и расходует память пропорционально длине контекста; одна H100 (80 ГБ HBM3) фит ограниченное число параллельных запросов; новые запросы прибывают в течение всего decode-цикла уже идущих.
 
@@ -1607,7 +1608,7 @@ PgBouncer — легковесный пулер соединений для Post
 
 **Задача:** для нового inference-запроса выбрать GPU-воркер так, чтобы минимизировать TTFT и максимизировать переиспользование KV-cache от похожих prompt-ов (общий system-prompt, few-shot, длинная история диалога).
 
-**Ограничения:** ~270+ GPU-воркеров в US (точное число — §11), peak 137 996 запросов/сек, каждый воркер хранит частичный KV-cache от уже обработанных prompt-ов до eviction по LRU.
+**Ограничения:** ~640 GPU-воркеров в US (точное число — §11), peak 135 996 запросов/сек, каждый воркер хранит частичный KV-cache от уже обработанных prompt-ов до eviction по LRU.
 
 **Шаги работы — Prefix-aware least-loaded:**
 
@@ -1627,7 +1628,7 @@ PgBouncer — легковесный пулер соединений для Post
 - **Sticky by `user_id`** — помогает только в рамках одного диалога, не использует переиспользование между юзерами с одинаковым system prompt.
 - **Consistent hashing по `conv_id`** — теряет least-loaded свойство при skew нагрузки.
 
-**Обоснование:** prefix-aware routing — стандартный приём в production-серверах LLM (SGLang [^17], vLLM prefix caching). Для AI-чата с типовыми system-prompt и многоraund-диалогами 40–70% запросов имеют значимый shared prefix.
+**Обоснование:** prefix-aware routing — стандартный приём в production-серверах LLM (SGLang [^17], vLLM prefix caching). Для AI-чата с типовыми system-prompt и многораундовыми диалогами 40–70% запросов имеют значимый shared prefix.
 
 **Влияние на архитектуру:**
 - §4: `inference-scheduler` — отдельный Deployment с HPA, queue depth публикуется через Prometheus.
@@ -1705,7 +1706,7 @@ PgBouncer — легковесный пулер соединений для Post
 
 # 8. Технологии
 
-### Backend и сетевой слой
+## 8.1 Backend и сетевой слой
 
 | Технология | Область применения | Почему |
 | --- | --- | --- |
@@ -1713,7 +1714,7 @@ PgBouncer — легковесный пулер соединений для Post
 | gRPC + Protocol Buffers | Межсервисное взаимодействие (`chat → regional-inference → inference-scheduler → gpu-worker`) | Server-streaming для токенов, бинарный формат, нативный flow control HTTP/2 (backpressure) |
 | SSE (Server-Sent Events) | `chat / api-gateway → клиент` | Однонаправленный стрим токенов поверх HTTP; не требует WebSocket-state, лучше работает через корп. прокси |
 
-### Балансировка и роутинг
+## 8.2 Балансировка и роутинг
 
 | Технология | Область применения | Почему |
 | --- | --- | --- |
@@ -1721,7 +1722,7 @@ PgBouncer — легковесный пулер соединений для Post
 | MetalLB | L4 в k8s, ECMP-распределение Anycast-пакетов по edge-нодам (§4.1) | Нативная интеграция с k8s `Service: LoadBalancer`, BGP-mode даёт корректное распределение без NAT-bottleneck |
 | ingress-nginx | L7: TLS termination, маршрутизация по `Host`, SSE-passthrough (§4.1) | Бенчмарк-материал в требованиях [^13]; нативная поддержка SSE через `proxy_buffering off`, аннотации для sticky / `proxy_next_upstream` |
 
-### Базы данных и хранилища
+## 8.3 Базы данных и хранилища
 
 | Технология | Область применения | Почему |
 | --- | --- | --- |
@@ -1734,7 +1735,7 @@ PgBouncer — легковесный пулер соединений для Post
 | Redis Cluster 7 | Sessions, apikey-cache, rate-limit counters, reference-кеш (§6.8) | Низкая latency (<1 мс), TTL, Lua-script atomicity, 16 384 hash slots для горизонтального масштабирования, hash-tag `{}` для co-location |
 | Ceph (RGW + RADOS) | Объектное хранилище: вложения (~126 ПБ/год), бэкапы PG/Scylla/CH/Redis | S3-совместимый API, self-hosted, Erasure Coding 8+3 (overhead ×1.375 vs ×3 у replication), multisite-репликация между ДЦ |
 
-### Inference / GPU
+## 8.4 Inference / GPU
 
 | Технология | Область применения | Почему |
 | --- | --- | --- |
@@ -1742,7 +1743,7 @@ PgBouncer — легковесный пулер соединений для Post
 | vLLM | Inference-движок на GPU-воркерах | PagedAttention + continuous batching (§7.1); throughput ×2-24 vs HF Transformers [^15]; production-проверен |
 | NCCL / InfiniBand | Tensor-parallel между GPU внутри одной ноды | Стандарт для collective-операций (`all-reduce`) при TP-инференсе моделей >70B параметров |
 
-### Контейнеризация и оркестрация
+## 8.5 Контейнеризация и оркестрация
 
 | Технология | Область применения | Почему |
 | --- | --- | --- |
@@ -1750,7 +1751,7 @@ PgBouncer — легковесный пулер соединений для Post
 | Kubernetes | Оркестрация stateless-пулов, HPA, self-healing, rolling update (§4) | Декларативная модель `Deployment` / `DaemonSet` / `Service`, нативная интеграция с MetalLB и ingress-nginx |
 | Helm | Параметризация и версионирование манифестов | Один и тот же чарт раскатывается в 4 ДЦ с разными values; rollback одной командой |
 
-### Наблюдаемость
+## 8.6 Наблюдаемость
 
 | Технология | Область применения | Почему |
 | --- | --- | --- |
@@ -1771,8 +1772,8 @@ RPO/RTO ниже относится к онлайн-failover, а не к вос�
 | Edge L4 (MetalLB) | DaemonSet на каждой edge-ноде; `externalTrafficPolicy: Local`, ECMP по живым speaker-pod-ам | Отказ edge-ноды → MetalLB снимает её из ECMP, трафик уходит на соседние edge-ноды |
 | Edge L7 (ingress-nginx) | DaemonSet на каждой edge-ноде, **2N @ 50%** (§4.3) — 30 нод глобально | Отказ половины парка → оставшиеся выходят на 100% без деградации |
 | Stateless backend (`api-gateway`, `chat`, `files`, `regional-inference`, `inference-scheduler`) | `Deployment` + `HPA`, **N+1**; `proxy_next_upstream` ретраит на следующий pod (§4.4) | Отказ pod-а → readiness probe → kube-proxy исключает из Service; ретрай прозрачен для клиента |
-| GPU workers | N+M (запас под отказ ноды); inference-scheduler возвращает 503 / Retry-After при перегрузке | Отказ GPU-ноды → scheduler перестаёт назначать; клиент ретраит с тем же `request_id` (§5.2) |
-| PostgreSQL (user data + attachments metadata) | Patroni + etcd; **1 primary + 1 sync replica в US East + 1 async replica в US West** на шард; PgBouncer перед PG; Citus reference tables на всех worker-ах | Отказ primary-ноды → Patroni promote sync-реплики за ~10 сек, RPO=0. Потеря US East → promote async-реплики в US West, RPO = фактический WAL replay lag |
+| GPU workers | 2N по US-регионам: 320 GPU-нод в US East + 320 в US West (§11.2); inference-scheduler возвращает 503 / Retry-After при перегрузке | Отказ GPU-ноды → scheduler перестаёт назначать; отказ одного US-GPU региона → второй регион держит пик без потери данных, но с меньшим запасом |
+| PostgreSQL (user data + attachments metadata) | Patroni + etcd; **1 primary + 1 sync replica в другой зоне отказа US East + 1 async replica в US West** на шард; PgBouncer перед PG; Citus reference tables на всех worker-ах | Отказ primary-ноды/зоны → Patroni promote sync-реплики за ~10 сек, RPO=0. Потеря US East → promote async-реплики в US West, RPO = фактический WAL replay lag |
 | PostgreSQL (audit_log) | Append-only PG-кластер: primary + async replica + WAL archiving / cold-tier archive (§6.12) | Отказ primary → promote async-реплики, RPO = фактический WAL replay lag; восстановление из бэкапа даёт RPO < 1 мин |
 | PostgreSQL (billing_accounts) | Отдельный кластер в US East: **1 primary + 1 sync replica в другой зоне отказа** для локального RPO=0; **async replica в US West** для DR; lag контролируется через `pg_stat_replication.replay_lag`, порог 5 сек | Отказ primary/зоны отказа → promote sync (RPO=0, RTO <5 сек). Полный отказ US East → API pay-as-you-go fail-closed; ручной promote US West только если `replay_lag ≤ 5 сек`, иначе RPO = фактический lag async-реплики |
 | ScyllaDB (messages) | Multi-DC `NetworkTopologyStrategy`, **RF=3 в каждом DC, total RF=12**; LOCAL_QUORUM=2 (§6.5) | Отказ 1 ноды в DC → LOCAL_QUORUM из 2 (RPO=0, RTO=0). Потеря целого DC → клиент-драйвер переключается на соседний DC; RPO для последних записей = lag меж-ДЦ репликации |
@@ -1794,11 +1795,206 @@ RPO/RTO ниже относится к онлайн-failover, а не к вос�
 | Полный отказ US East для billing | Web и неплатёжные API работают | Новые API pay-as-you-go fail-closed до ручного решения; in-flight paid-запросы ретраятся клиентом с тем же `request_id` | Async-реплика в US West не промоутится автоматически: если `replay_lag ≤ 5 сек`, promote с RPO до 5 сек; если lag выше, RPO равен фактическому lag async-реплики |
 | Отказ 1 ноды ScyllaDB в DC | Чтение/запись всех сообщений работают | Нет деградации | LOCAL_QUORUM=2 при RF=3 переживает отказ 1 ноды локально |
 | Полный отказ ДЦ EU | Web/API для пользователей EU уходит в US East (Anycast fallback, §3.5) | TTFT для EU +80–150 мс; нагрузка на US East ×2 на короткое окно | Anycast withdraw; ScyllaDB-данные есть в остальных ДЦ, кроме последних записей в пределах lag меж-ДЦ репликации; inference уже централизован в US |
-| Полный отказ US East И US West (одновременный) | HTTP-слой EU/APAC работает: history, list, login, UI | Новые inference возвращают 503 — GPU только в США | Осознанный компромисс: вторая GPU-площадка вне США удвоила бы инфраструктурные расходы (§3.5) |
+| Полный отказ US East И US West (одновременный) | HTTP edge EU/APAC и внешний CDN остаются доступны | Новые inference возвращают 503; login/list/API billing и PG-backed metadata недоступны | Осознанный компромисс: GPU и PostgreSQL primary/DR находятся в US; вторая полноценная площадка вне США резко увеличила бы инфраструктурные расходы (§3.5) |
 | Отказ Redis-кластера в регионе | Чтение PG работает | Сессии теряются (юзер перелогинится); Web rate-limit переходит на локальный token-bucket, API fail-closed / консервативный лимит; reference-cache → PG (повышенная нагрузка) | Source of truth — PG; Redis не авторитетен. После восстановления sessions пересоздаются на логине |
 | Отказ Ceph RGW в регионе | Чтение старых вложений работает (multisite копия) | Новые upload-ы недоступны в регионе до восстановления | EC 8+3 переживает потерю 3 OSD одновременно; полный отказ региона → клиент льёт в соседний |
 | Отказ ClickHouse | API/Web работают | Биллинг-дашборды и анти-абуз недоступны | `usage_records` — append-only OLAP, не на горячем пути; биллинг-резерв (`billing_accounts`) идёт в PG, не CH |
 | Отказ Observability | Весь пользовательский трафик работает | Метрики, логи, трейсы недоступны | Observability не на serving path; алерты дублируются через PagerDuty webhook |
+
+# 10. Схема проекта
+
+## 10.1 Схема взаимодействия сервисов
+
+```mermaid
+flowchart LR
+    Client["Web / API clients<br/>HTTPS + SSE"] --> DNS["DNS<br/>chat/api/attach.llm.com"]
+    DNS --> Anycast["Internet BGP<br/>Anycast /24"]
+    Anycast --> Edge["Nearest DC edge<br/>Router -> MetalLB -> ingress-nginx"]
+
+    subgraph Local["Local serving layer in selected DC"]
+      direction TB
+      Api["api-gateway<br/>API auth + reserve"]
+      Chat["chat<br/>Web SSE + context build"]
+      Files["files<br/>presigned URLs"]
+      Redis["Redis Cluster<br/>sessions, api_key cache, rate_limits"]
+      Scylla["ScyllaDB<br/>messages"]
+      RGW["Ceph RGW<br/>attachments"]
+      RegInf["regional-inference<br/>gRPC adapter"]
+    end
+
+    Edge -->|"Host: api.llm.com"| Api
+    Edge -->|"Host: chat.llm.com"| Chat
+    Edge -->|"Host: attach.llm.com"| Files
+
+    Api -->|"auth / rate-limit"| Redis
+    Chat -->|"session / rate-limit"| Redis
+    Chat -->|"context read"| Scylla
+    Files -->|"PUT/GET blob"| RGW
+
+    Api -->|"Generate request"| RegInf
+    Chat -->|"Generate request"| RegInf
+
+    subgraph USGPU["US GPU plane: US East + US West"]
+      direction TB
+      Scheduler["inference-scheduler<br/>AssignWorker"]
+      GPU["gpu-worker<br/>vLLM + H100"]
+    end
+
+    RegInf -->|"control RPC"| Scheduler
+    Scheduler -->|"worker endpoint"| RegInf
+    RegInf -->|"Generate(): request + TokenEvent stream"| GPU
+    RegInf -->|"SSE TokenEvents via ingress"| Edge
+    Edge --> Client
+```
+
+Асинхронные и durable-потоки вынесены отдельно, чтобы не смешивать hot-path генерации с побочными записями:
+
+```mermaid
+flowchart LR
+    subgraph Apps["Serving services"]
+      direction TB
+      Api["api-gateway"]
+      Chat["chat"]
+      Files["files"]
+      GPU["gpu-worker"]
+    end
+
+    subgraph USState["US durable state"]
+      direction TB
+      PGUser["PostgreSQL/Citus user data<br/>users, conversations, api_keys,<br/>attachments metadata"]
+      Billing["PostgreSQL billing_accounts<br/>reserve/finalize"]
+      CH["ClickHouse<br/>usage_records"]
+      Audit["PostgreSQL audit_log"]
+    end
+
+    subgraph RegionalState["Regional state"]
+      direction TB
+      Redis["Redis Cluster<br/>sessions, api_key cache, rate_limits"]
+      Scylla["ScyllaDB<br/>messages"]
+      RGW["Ceph RGW<br/>attachments blob"]
+      Obs["Prometheus / Loki / Tempo"]
+    end
+
+    Api -->|"api_key cache miss"| PGUser
+    Chat -->|"conversations metadata"| PGUser
+    Files -->|"attachment metadata"| PGUser
+    Api -->|"reserve / finalize"| Billing
+
+    Chat -->|"message history"| Scylla
+    Files -->|"presigned PUT/GET"| RGW
+    GPU -.->|"pull attachment by presigned GET"| RGW
+
+    Api -.->|"usage async insert"| CH
+    Chat -.->|"usage async insert"| CH
+    Api -.->|"security events"| Audit
+    Chat -.->|"security events"| Audit
+    Apps -.->|"metrics / logs / traces"| Obs
+```
+
+## 10.2 Пояснение к потокам
+
+| Поток | Как проходит | Почему так |
+| --- | --- | --- |
+| Внешняя балансировка | DNS отдаёт один Anycast IP; BGP направляет пакет в ближайший живой ДЦ; при отказе ДЦ edge-router снимает анонс (§3.4–§3.5) | DNS не участвует в выборе региона, failover идёт на сетевом уровне за 30–90 сек |
+| Локальная балансировка | Внутри ДЦ MetalLB распределяет пакет по edge-нодам, ingress-nginx терминирует TLS и маршрутизирует по `Host`, k8s Service выбирает backend pod (§4) | Внешний TLS/SSE остаётся на L7, а pod-ы масштабируются через HPA |
+| Web inference | `chat` проверяет session/rate-limit в Redis, читает `conversations` в PostgreSQL/Citus в US, собирает последние сообщения из локальной ScyllaDB и отдаёт запрос в `regional-inference` | Web хранит историю на сервере, поэтому контекст собирается из БД на каждый prompt |
+| API inference | `api-gateway` проверяет API-ключ в Redis/PG, делает `reserve` в `billing_accounts`, затем передаёт stateless payload в inference | API-клиент сам присылает полный контекст; сервер хранит только биллинг и usage |
+| Поток токенов | `inference-scheduler` выбирает GPU worker, но токены через него не идут; `gpu-worker → regional-inference → ingress-nginx → SSE client` | Scheduler остаётся control plane, не становится bottleneck для миллионов token events |
+| Вложения | `files` выдаёт presigned URL; клиент льёт файл напрямую в Ceph RGW; GPU worker при multimodal-запросе тянет объект по короткоживущему presigned GET | Большие файлы не проходят через ingress/backend; hot-path держит только метаданные |
+| Биллинг и аналитика | `billing_accounts` в PostgreSQL списывает деньги синхронно; `usage_records` в ClickHouse пишется async после завершения запроса | Деньги требуют Strong consistency, аналитика допускает задержку до секунд |
+| Наблюдаемость | Все сервисы пишут метрики, логи и traces с общим `request_id` | `request_id` связывает HTTP-запрос, usage, audit и trace одного inference-цикла |
+
+## 10.3 Региональные особенности
+
+| Компонент | Где живёт | Комментарий |
+| --- | --- | --- |
+| HTTP edge (`ingress-nginx`, `api-gateway`, `chat`, `files`) | Все 4 ДЦ | Принимает пользователей локально, чтобы не гонять TLS/SSE через океан |
+| Redis sessions/rate-limit | Per-region | Проверяется на каждом HTTP-запросе; межрегиональный hop добавил бы 80–150 мс |
+| PostgreSQL/Citus user data | Primary US East, sync/async replicas US East/West | EU/APAC не держат PG-ноды; metadata-запросы ходят в US через backbone, а hot auth/rate-limit остаётся в локальном Redis |
+| `inference-scheduler`, `gpu-worker` | Только US East / US West | GPU-парк централизован в США; EU/APAC проксируют gRPC через backbone (§3.6) |
+| `billing_accounts` | Primary US East, DR US West | Деньги нельзя списывать независимо в нескольких регионах; failover описан в §9 |
+| ScyllaDB messages | Все 4 ДЦ | История диалогов читается локально через `LOCAL_QUORUM` |
+| Ceph RGW attachments | Все 4 ДЦ | Клиент загружает в ближайший endpoint; GPU pull может идти через backbone |
+
+Latency-бюджет для первого токена:
+
+| Регион пользователя | Клиент → edge | Edge → origin | Regional Inference → US GPU | TTFT |
+| --- | ---: | ---: | ---: | ---: |
+| US East / US West | ~5 мс | ~5 мс | ~10 мс | ~150–300 мс |
+| EU | ~10 мс | ~15 мс | ~80 мс | ~250–400 мс |
+| APAC | ~30 мс | ~20 мс | ~150 мс | ~400–600 мс |
+
+# 11. Список серверов
+
+## 11.1 Требования к ресурсам
+
+| Подсистема | Нагрузка / объём | CPU | RAM | Диск | Сеть | Краткий расчёт |
+| --- | ---: | ---: | ---: | ---: | ---: | --- |
+| Edge L7 | 170 108 HTTP RPS peak, 1.2 млн SSE | 480 vCPU | 960 GB | 6 TB SSD | 30×25 GbE | 30 edge-нод из §4.3: узкое место — 100k SSE/нода |
+| Stateless backend | 170k HTTP RPS + gRPC adapter | 512 vCPU | 1 TB | 3.2 TB SSD | 16×10 GbE | 16 worker-нод; pod requests ~100 vCPU, limits ~200 vCPU |
+| GPU inference | 135 996 inference RPS peak | 10k+ vCPU | 1.25 PB RAM | 19.6 PB NVMe | 640×4×400 GbE | 8×H100-нода держит ~430 inference RPS; `ceil(135996/430)=317`, берём 320 нод в каждом US-регионе для 2N |
+| PostgreSQL/Citus user data | ~64 TB logical hot data | 1 600 vCPU | 6.4 TB | 400 TB NVMe | 100×10 GbE | 64 shards; 32 primary workers + 32 sync + 32 async + coordinators |
+| PostgreSQL billing | 156 250 write QPS peak | 1 536 vCPU | 6 TB | 96 TB NVMe | 96×10 GbE | 32 billing shards × 3 replicas; ~4.9k write/s на primary-шард |
+| PostgreSQL audit | 6.8 TB/year append-only | 128 vCPU | 512 GB | 32 TB NVMe | 8×10 GbE | Партиции по дате + async replica |
+| ScyllaDB messages | ~37 PB effective/year | 19 840 vCPU | 155 TB | 59 PB raw NVMe | 620×25 GbE | 155 нод × 4 ДЦ из §6.5 |
+| Redis Cluster | 169k auth + 170k rate-limit ops peak | 256 vCPU | 2 TB | 32 TB NVMe | 32×10 GbE | 4 master + 4 replica на регион; largest region <80 GB hot data before replica |
+| ClickHouse | 135 996 inserts/s peak, 243 TB/year | 256 vCPU | 2 TB | 640 TB | 16×25 GbE | 8 shards × 2 replicas; hot NVMe + cold HDD |
+| Ceph RGW | 126 PB/year attachments | 19 392 vCPU | 75 TB | 520 PB raw HDD | 1 200×25 GbE | 1 200 OSD + 12 service nodes из §6.7 |
+| Observability | Метрики/логи/traces всех сервисов | 128 vCPU | 512 GB | 32 TB NVMe | 8×10 GbE | 2 observability-ноды на ДЦ |
+
+GPU capacity в §11 — проектное benchmark-допущение для сервера 8×H100 с vLLM, continuous batching и моделью класса Claude Sonnet: ~430 завершённых inference-запросов/сек на ноду при среднем миксе Web/API из §2.2. Перед production-закупкой это число проверяется нагрузочным тестом выбранной модели; если фактический throughput ниже, количество GPU-нод масштабируется линейно.
+
+## 11.2 Серверы
+
+| Пул / сервис | Конфигурация сервера | US East | US West | EU | APAC | Итого | Что размещается |
+| --- | --- | ---: | ---: | ---: | ---: | ---: | --- |
+| Kubernetes control plane | 8 vCPU / 16 GB RAM / 200 GB SSD / 10 GbE | 3 | 3 | 3 | 3 | **12** | kube-apiserver, scheduler, controller-manager, etcd |
+| Edge k8s node | 16 vCPU / 32 GB RAM / 200 GB SSD / 25 GbE | 6 | 6 | 10 | 8 | **30** | `ingress-nginx`, `metallb-speaker` |
+| Worker k8s node | 32 vCPU / 64 GB RAM / 200 GB SSD / 10 GbE | 4 | 4 | 4 | 4 | **16** | `api-gateway`, `chat`, `files`, `regional-inference`, `inference-scheduler` |
+| GPU k8s node | 2×Intel Xeon Platinum (~128 vCPU) / 8×H100 80 GB / 2 TB RAM / 8×3.84 TB NVMe / 4×400 GbE | 320 | 320 | 0 | 0 | **640** | `gpu-worker`, vLLM, NCCL |
+| PostgreSQL/Citus user cluster | 16 vCPU / 64 GB RAM / 4 TB NVMe / 10 GbE | 66 | 34 | 0 | 0 | **100** | users, conversations, api_keys, attachments metadata |
+| PostgreSQL billing cluster | 16 vCPU / 64 GB RAM / 1 TB NVMe / 10 GbE | 64 | 32 | 0 | 0 | **96** | `billing_accounts`: 32 shards × 3 replicas |
+| PostgreSQL audit cluster | 16 vCPU / 64 GB RAM / 4 TB NVMe / 10 GbE | 8 | 0 | 0 | 0 | **8** | `audit_log`, WAL archive writer |
+| ScyllaDB node | 32 vCPU / 256 GB RAM / 24×4 TB NVMe / 25 GbE | 155 | 155 | 155 | 155 | **620** | `messages`, `messages_by_request` |
+| Redis node | 8 vCPU / 64 GB RAM / 1 TB NVMe / 10 GbE | 8 | 8 | 8 | 8 | **32** | sessions, api_key cache, rate_limits, reference cache |
+| ClickHouse node | 16 vCPU / 128 GB RAM / 8 TB NVMe + 32 TB HDD / 25 GbE | 16 | 0 | 0 | 0 | **16** | `usage_records` |
+| ClickHouse Keeper node | 4 vCPU / 8 GB RAM / 200 GB SSD / 10 GbE | 3 | 0 | 0 | 0 | **3** | replication metadata для ClickHouse |
+| Ceph OSD node | 16 vCPU / 64 GB RAM / 24×18 TB HDD + NVMe DB / 25 GbE | 480 | 360 | 240 | 120 | **1 200** | attachment objects, backups, traces/log backend |
+| Ceph service node | 16 vCPU / 64 GB RAM / 1 TB NVMe / 25 GbE | 3 | 3 | 3 | 3 | **12** | MON, MGR, RGW |
+| Observability node | 16 vCPU / 64 GB RAM / 4 TB NVMe / 10 GbE | 2 | 2 | 2 | 2 | **8** | Prometheus, Alertmanager, Grafana, Loki, Tempo |
+| Edge router | HA-router, 2×100/400 GbE uplinks, BGP full table | 2 | 2 | 2 | 2 | **8** | external BGP, Anycast `/24`, iBGP backbone |
+| **Итого** | — | **1 140** | **929** | **427** | **305** | **2 801** | без учёта внешнего CDN для статики |
+
+## 11.3 Kubernetes / контейнеры
+
+| Pod / workload | Реплики | CPU request / limit | RAM request / limit | Размещение | Скалирование |
+| --- | ---: | --- | --- | --- | --- |
+| `ingress-nginx` | 30 | 8 / 24 CPU | 16 / 32 GB | edge-ноды всех ДЦ | DaemonSet, 2N из §4.3 |
+| `metallb-speaker` | 30 | 0.1 / 0.5 CPU | 100 / 500 MB | edge-ноды всех ДЦ | DaemonSet |
+| `api-gateway` | 28 | 1 / 2 CPU | 2 / 4 GB | worker-ноды всех ДЦ | HPA по CPU/RPS |
+| `chat` | 20 | 1 / 2 CPU | 2 / 4 GB | worker-ноды всех ДЦ | HPA по SSE/RPS |
+| `files` | 8 | 0.5 / 1 CPU | 1 / 2 GB | worker-ноды всех ДЦ | HPA по RPS |
+| `regional-inference` | 20 | 1 / 2 CPU | 2 / 4 GB | все ДЦ; больше реплик в EU/APAC | HPA по gRPC streams |
+| `inference-scheduler` | 14 | 2 / 4 CPU | 4 / 8 GB | US East / US West | HPA по queue depth |
+| `gpu-worker` | 640 | 16 CPU / 16 CPU + 8 GPU | 256 / 512 GB | GPU-ноды US East / US West | 1 pod на GPU-ноду |
+| `pgbouncer` | 8 | 0.5 / 1 CPU | 512 MB / 1 GB | worker-ноды всех ДЦ | 2 pod на ДЦ |
+| `prometheus` | 8 | 2 / 4 CPU | 8 / 16 GB | observability-ноды | HA pair per ДЦ |
+| `alertmanager` | 4 | 0.5 / 1 CPU | 1 / 2 GB | observability-ноды | 1 pod per ДЦ |
+| `grafana` | 4 | 0.5 / 1 CPU | 1 / 2 GB | observability-ноды | 1 pod per ДЦ |
+| `loki` | 8 | 2 / 4 CPU | 4 / 8 GB | observability-ноды | 2 pod per ДЦ |
+| `tempo` | 4 | 1 / 2 CPU | 4 / 8 GB | observability-ноды | 1 pod per ДЦ |
+
+Stateful СУБД (`PostgreSQL/Citus`, `ScyllaDB`, `Redis`, `ClickHouse`, `Ceph`) в этой схеме вынесены на отдельные bare-metal пулы, а не запускаются внутри общего worker pool Kubernetes. Это убирает CPU throttling, лишний overlay-network hop и риск переселения pod-а с локальными данными на неподготовленный диск.
+
+## 11.4 Backbone и внешняя сеть
+
+| Канал / компонент | Конфигурация | Зачем |
+| --- | --- | --- |
+| US East ↔ US West | 2×100 Gbit/s DWDM, разные физические трассы | GPU failover, PG async replication, Scylla/Ceph replication |
+| EU ↔ US East | 2×100 Gbit/s DWDM, разные физические трассы | EU `regional-inference` → US GPU, Scylla/Ceph replication |
+| APAC ↔ US West | 2×100 Gbit/s DWDM, разные физические трассы | APAC `regional-inference` → US GPU, Scylla/Ceph replication |
+| EU ↔ APAC | 1×100 Gbit/s резервный маршрут | Обходной путь при деградации US backbone |
+| Upstream Internet per ДЦ | минимум 2 независимых провайдера, BGP full table | Anycast `/24`, DDoS-фильтрация у upstream |
 
 # Источники
 
@@ -1814,11 +2010,11 @@ RPO/RTO ниже относится к онлайн-failover, а не к вос�
 
 [^6]: OpenAI. *How people are using ChatGPT.* https://openai.com/index/how-people-are-using-chatgpt/ [Полная версия статьи](https://cdn.openai.com/pdf/a253471f-8260-40c6-a2cc-aa93fe9f142e/economic-research-chatgpt-usage-paper.pdf)
 
-[^7]: LMSYS-Chat-1M dataset (2023)
+[^7]: LMSYS-Chat-1M dataset (2023). https://huggingface.co/datasets/lmsys/lmsys-chat-1m
 
 [^8]: WildChat dataset (1M–50M реальных диалогов с chatbot-ами) — avg 295.58 user tokens per turn, avg context 1143.4 tokens, avg 2.52 turn per conversation, 41% multi-turn, 3.7% > 10 turn. https://wildchat.allen.ai/
 
-[^9]: ShareChat dataset — avg 1,115.30 assistant tokens per turn 
+[^9]: SHARECHAT: A Dataset of Chatbot Conversations in the Wild — avg 1,115.30 assistant tokens per turn. https://openreview.net/pdf?id=oTYeAnIsiD
 
 [^10]: OpenRouter — avg prompt ~6K tokens, completion ~400 tokens (2025) https://openrouter.ai/state-of-ai
 
