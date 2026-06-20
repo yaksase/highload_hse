@@ -41,18 +41,18 @@
 
 * **Роль:** `gpu-worker` pod-ы (continuous batching на H100).
 * **Конфигурация:** 8×H100 (80 GB HBM3) / 2× Intel Xeon Platinum / 2 TB DDR5 RAM / 8×3.84 TB NVMe / 4×400 Gbps NIC (NDR InfiniBand или RoCE для intra-cluster collective ops при tensor-parallel inference на больших моделях).
-* **Число:** определяется через RPS / batch capacity GPU (зависит от модели). Прикидка: для пика 137 000 inference RPS при средней TTFT 1–3 сек и continuous batching ~64 запросов/GPU — нужно **~2000–2500 H100** = **250–315 нод** на US East + US West.
-* **Размещение:** только US East и US West (см. §3.2 — обоснование через утилизацию, power и operational overhead).
+* **Число:** определяется через RPS / рабочую пропускную способность GPU (зависит от модели). В README принято ~430 inference RPS на 8×H100-ноду; для пика 135 996 RPS нужно `ceil(135996/430)=317` нод в одном US-регионе, берём **350 + 350 = 700 GPU-нод** для запаса на отказ и 2N между US East / US West.
+* **Размещение:** только US East и US West (см. §3.2 — обоснование через загрузку, энергопотребление и сложность эксплуатации).
 
 ---
 
 ## 2. Контейнеры (k8s pod-ы)
 
-### Stateless backend (Deployment + HPA)
+### Backend без состояния (Deployment + HPA)
 
-Baseline N+1 prim. расчёт исходя из RPS из §2/§3:
+Базовый N+1-расчёт исходя из RPS из §2/§3:
 
-| Pod | Peak RPS (global) | Профиль | Pod capacity (без TLS) | Min N | **N+1 baseline (4 ДЦ)** | CPU/RAM на pod |
+| Pod | Пиковый RPS глобально | Профиль | Ёмкость pod-а (без TLS) | Min N | **N+1 база (4 ДЦ)** | CPU/RAM на pod |
 | --- | ---: | --- | ---: | ---: | ---: | --- |
 | `api-gateway` | ~78 000 | короткие auth/billing/proxy | ~15 000 RPS | 6 | **7 × 4 = 28** | request 1 CPU / 2 GB, limit 2 CPU / 4 GB |
 | `chat` | ~60 000 | долгие SSE-стримы, HTTP/2 | ~15 000 RPS | 4 | **5 × 4 = 20** | request 1 CPU / 2 GB, limit 2 CPU / 4 GB |
@@ -61,7 +61,7 @@ Baseline N+1 prim. расчёт исходя из RPS из §2/§3:
 | `inference-scheduler` (US only) | ~137 000 | gRPC control plane | ~25 000 RPS | 6 | **7 × 2 ДЦ = 14** | request 2 CPU / 4 GB, limit 4 CPU / 8 GB |
 | `gpu-worker` | — | continuous batching на H100 | ~зависит от модели | — | по числу H100 (см. §11.1) | 8 GPU / 2 CPU / 256 GB RAM |
 
-HPA масштабирует выше baseline под текущую нагрузку. Метрика — CPU 60% для api-gateway/chat/files, queue depth для inference-scheduler.
+HPA масштабирует выше базового числа под текущую нагрузку. Метрика — CPU 60% для api-gateway/chat/files, глубина очереди для inference-scheduler.
 
 ### DaemonSet
 
@@ -81,15 +81,15 @@ HPA масштабирует выше baseline под текущую нагру�
   * Реплики: 1 primary + 1 sync + 1 async = ×3.
   * Размещение: US East + US West.
   * Число: закрыто в README §11 — 100 нод суммарно для user-кластера (primary/sync/async + coordinators).
-* **billing_accounts:** отдельный кластер, SERIALIZABLE consistency. 32 шарда. Primary в US East, DR async replica в US West (см. §6.4 / §9).
-* **audit_log:** US East only. 16 партиций по дате.
+* **billing_accounts:** отдельный 3-нодовый PG-кластер, строгая консистентность SERIALIZABLE, без шардирования. Primary + sync replica в US East, async DR replica в US West; списание по каждому запросу вынесено в Redis `bill:{account_id}`, PG получает 5-секундные окна резерва и сверки (см. §6.4 / §9).
+* **audit_log:** 3-нодовый PG-кластер: primary + sync в US East, async DR в US West. Без hash-шардирования; дневные партиции по `created_at`, индекс `(user_id, created_at DESC)` внутри партиции.
 * **subscription_tiers / models:** reference tables, logical replication на каждый шард.
 
 ### ScyllaDB
 
 * **messages + messages_by_request:** multi-DC keyspace, RF=3 в каждом DC (total RF=12) — LOCAL_QUORUM=2 устойчив к отказу 1 ноды локально.
-* Конфигурация ноды: 24 × 4 TB NVMe = 96 TB raw → ~60 TB usable / 32 vCPU / 256 GB / 25 GbE.
-* Число (из §6.5): **~155 нод × 4 ДЦ ≈ 620 нод суммарно** на 37 ПБ effective per year.
+* Конфигурация ноды: 24 × 4 TB NVMe = 96 TB номинальной ёмкости → ~60 TB полезной ёмкости / 32 vCPU / 256 GB / 25 GbE.
+* Число (из §6.5): **~155 нод × 4 ДЦ ≈ 620 нод суммарно** на 37 ПБ полезного объёма в год.
 
 ### ClickHouse
 
@@ -157,7 +157,7 @@ HPA масштабирует выше baseline под текущую нагру�
 ## 5. Что закрыто при заполнении §11
 
 * [x] Worker-ноды: 4 на ДЦ, 16 суммарно.
-* [x] GPU-ноды: 320 в US East + 320 в US West, 640 суммарно.
+* [x] GPU-ноды: 350 в US East + 350 в US West, 700 суммарно.
 * [x] PostgreSQL user-cluster: 100 нод суммарно.
 * [x] Redis: 4 master + 4 replica на регион, 32 ноды суммарно.
 * [x] DDoS-фильтрация: у upstream-провайдера каждого ДЦ.

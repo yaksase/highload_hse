@@ -86,7 +86,7 @@ Bidi-стрим нам **не нужен**: в обычном чате клие�
 * **Redis Streams как streaming buffer** превращается в точку с ~2.3M QPS чтения токенов — это дополнительный hop, который забирает 30–50% end-to-end latency (самый заметный для пользователя показатель — time-to-first-token).
 * **Backpressure с буфером**: Redis не отдаёт обратное давление к GPU, и на медленном клиенте буфер растёт → нужно либо дропать токены, либо ограничивать concurrency. Прямой gRPC-стрим решает проблему «бесплатно».
 
-Асинхронные события (usage, audit) пишутся **без Kafka** — напрямую в ClickHouse (async insert) и PostgreSQL (append-only таблица).
+Асинхронные события (usage, audit) пишутся **без Kafka** — напрямую в ClickHouse (async insert) и PostgreSQL (таблица только на добавление).
 
 ---
 
@@ -178,32 +178,32 @@ Pull выигрывает по трём осям сразу: **intra-region тр
 
 | Аспект                   | Решение                                                     |
 | ------------------------ | ----------------------------------------------------------- |
-| Нагрузка                 | Только API: ~8 700 RPS peak (Web использует tier-лимиты Rate Limiter) |
-| Latency от EU/APAC       | +80–150 мс — допустимо в рамках pre-inference шага          |
-| Consistency              | Strong (SERIALIZABLE-транзакции для reserve / finalize)     |
-| Failover                 | Sync-реплика в другой зоне отказа US East (RPO=0, автопромоут), async-реплика в US West для DR; promote только при `replay_lag ≤ 5 сек`, иначе RPO равен фактическому lag |
-| Shard key                | `hash(user_id) % 32` — все операции по одному аккаунту на одном шарде |
+| Нагрузка                 | Только API: списание по каждому запросу в Redis; PostgreSQL видит ~3.1k write QPS peak после 5-секундной агрегации |
+| Latency от EU/APAC       | +80–150 мс только при пополнении кредитного окна; обычный запрос идёт через локальный Redis |
+| Консистентность          | строгая (SERIALIZABLE-транзакции для резерва окна / сверки) |
+| Переключение при отказе  | Sync-реплика в другой зоне отказа US East (RPO=0, автопромоут), async-реплика в US West для DR; promote только при `replay_lag ≤ 5 сек`, иначе RPO равен фактическому lag |
+| Шардирование             | Не шардируется: `billing_accounts` <1 GB; write QPS снижен агрегацией в кредитном окне |
 
 Flow биллинга для API-запроса:
 
 ```
-1. API Gateway → Billing Reservation: reserve(user_id, max_cost)
-     max_cost = prompt_tokens × prompt_price
-              + max_completion_tokens × completion_price
-              + Σ estimated_image_tokens × image_price   ← для multimodal
-       где estimated_image_tokens ≈ ceil(attachment.size_bytes / 400)
+1. API Gateway → Redis: decrement `bill:{account_id}` на `estimated_cost`
+   ▸ если кредита хватает — запрос сразу идёт в inference
+   ▸ если кредита не хватает — Billing Reservation делает reserve chunk в PG
+2. Billing Reservation → PostgreSQL: reserve_chunk(user_id, chunk_cost)
+     chunk_cost ≈ max(5 sec expected spend, current estimated_cost)
      ▸ SELECT balance, reserved FROM billing_accounts WHERE user_id = ? FOR UPDATE
-     ▸ IF balance - reserved >= max_cost THEN UPDATE reserved += max_cost
-     ▸ возвращает reservation_id, либо 402 Payment Required
-2. Inference выполняется
-3. Chat Service (после закрытия SSE) → Billing Reservation: finalize(reservation_id, actual_cost)
-     actual_cost учитывает фактические image_tokens от vision encoder
-     ▸ UPDATE billing_accounts SET balance -= actual_cost, reserved -= max_cost
-     ▸ разница (max_cost - actual_cost) возвращается на баланс
+     ▸ IF balance - reserved >= chunk_cost THEN UPDATE reserved += chunk_cost
+     ▸ Redis `bill:{account_id}` получает `{reserved_usd, remaining_usd, window_id}`
+3. Inference выполняется
+4. Фоновый сверяющий процесс раз в 5 секунд агрегирует фактическое потребление и делает сверку `reconcile(user_id, actual_cost_sum)`
+     ▸ UPDATE billing_accounts SET balance -= actual_cost_sum, reserved -= chunk_cost
+     ▸ разница возвращается на баланс; usage_records остаётся в ClickHouse
+
 ```
 
 **Почему картинки нельзя тарифицировать только по `actual`:** без резервирования по `estimated_image_tokens` пользователь за $0.01 резерва прогонит 10 HD-картинок (~$0.05 фактической стоимости) → 5× overspend и отрицательный баланс. Оценка берётся **до** inference из `attachments.size_bytes`.
 
 ### Billing Ledger — аналитика (ClickHouse)
 
-`usage_records` (см. §5) — append-only-лог каждого завершённого запроса для биллинговых дашбордов, выставления счетов и anti-abuse. Chat Service пишет туда напрямую через ClickHouse async insert после финализации резерва.
+`usage_records` (см. §5) — журнал каждого завершённого запроса, только на добавление, для биллинговых дашбордов, выставления счетов и расследований злоупотреблений. Chat Service пишет туда напрямую через ClickHouse async insert после финализации резерва.
