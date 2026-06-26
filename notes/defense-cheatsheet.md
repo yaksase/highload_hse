@@ -29,7 +29,7 @@
 Числовой ответ:
 - **3 ДЦ** (US East + EU + APAC) — failover 1-в-2, при отказе одного оставшиеся на 150% нагрузки → деградация. Нет N+1.
 - **4 ДЦ** (US East + US West + EU + APAC) — N+1 на уровне регионов: 3 из 4 держат пиковую нагрузку.
-- **6 ДЦ** — каждый дополнительный сверх 4 экономит RTT 5–15 мс, что <3% от общего TTFT (250–400 мс). Не оправдывает удвоения сетевой инфраструктуры.
+- **6 ДЦ** — добавляют в основном edge-точки: при US-only GPU они не убирают межрегиональный путь до inference, а экономят только client→edge и немного jitter. Это не оправдывает удвоения сетевой инфраструктуры.
 
 ### «А что если упадут оба US-кластера?»
 
@@ -179,7 +179,7 @@ Multi-currency требует:
 
 | Решение | Что даёт | Цена / альтернатива |
 |---------|----------|---------------------|
-| **PostgreSQL только в US East+West** (users / conversations / api_keys / attachments_metadata) | Один primary, нет conflict resolution, простой MVP | EU/APAC `GET /v1/conversations` имеет +80–150 мс RTT, что на фоне inference TTFT 250–400 мс терпимо. Альтернатива — async replicas в EU/APAC; добавили бы сложности lag-handling без UX-выигрыша |
+| **PostgreSQL только в US East+West** (users / conversations / api_keys / attachments_metadata) | Один primary, нет conflict resolution, простой MVP | EU/APAC `GET /v1/conversations` имеет +80–150 мс RTT, поэтому горячие auth/rate-limit и история сообщений вынесены локально. Альтернатива — async replicas в EU/APAC; добавили бы сложности lag-handling без UX-выигрыша |
 | **ScyllaDB глобально (RF=3 в каждом ДЦ, total RF=12)** | Локальное чтение messages в EU/APAC спасает UX (открытие диалога не делает round-trip в US) | Storage cost высокий (~37 ПБ effective/year), но LOCAL_QUORUM=2 в каждом ДЦ переживает отказ одной локальной ноды без cross-DC fallback |
 | **billing_accounts primary в US East, DR в US West** | SERIALIZABLE-транзакции без distributed coordination — нельзя списать одни деньги дважды | RTT в US East из EU/APAC при reserve/finalize — заложен в SLA. Альтернатива (per-region billing с conflict resolution) — отдельный продукт сложности enterprise |
 | **ClickHouse только в US East** | Async insert `usage_records` от Chat/API Service из всех регионов; экономим на per-region инфре | Latency usage-инсертов терпит +150 мс: деньги уже синхронно зарезервированы/списаны в PostgreSQL billing |
